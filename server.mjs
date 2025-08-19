@@ -1,15 +1,10 @@
 // server.mjs — IaLife backend (Express + Quadcode SDK)
-// ENV necessários no Render:
-// ALLOW_ORIGIN="https://italosantanatrader.com,https://www.italosantanatrader.com"
-// ATRIUN_LOGIN, ATRIUN_PASSWORD
-// (opcionais com default) WS_URL, PLATFORM_ID, HTTP_HOST
 
 import express from 'express';
 import dotenv from 'dotenv';
 import { ClientSdk, LoginPasswordAuthMethod, SsidAuthMethod } from '@quadcode-tech/client-sdk-js';
 
 dotenv.config();
-
 const app = express();
 
 /* ---------------------- CORS ROBUSTO ---------------------- */
@@ -41,13 +36,17 @@ app.use((req, res, next) => {
 
 app.use(express.json());
 
-// ---- Config da Atriun / Quadcode ----
+// ---- Config Atriun / Quadcode ----
 const WS_URL = process.env.WS_URL || 'wss://ws.trade.atriunbroker.finance/echo/websocket';
 const PLATFORM_ID = Number(process.env.PLATFORM_ID || 499);
 const HTTP_HOST = process.env.HTTP_HOST || 'https://trade.atriunbroker.finance';
 
 let sdk = null;
 let lastConnectError = null;
+
+function missing(list) {
+  return list.filter(k => !process.env[k] || String(process.env[k]).trim() === '');
+}
 
 async function connectWithLogin(login, password) {
   lastConnectError = null;
@@ -71,7 +70,7 @@ async function connectWithSSID(ssid) {
   return true;
 }
 
-// ---------- Rotas ----------
+// ---------- Rotas utilitárias ----------
 app.get('/', (_req, res) => res.json({ ok: true, message: 'IaLife backend up' }));
 
 app.get('/status', (_req, res) => {
@@ -82,9 +81,30 @@ app.get('/status', (_req, res) => {
   });
 });
 
+// mostra envs (sem senha)
+app.get('/debug/env', (_req, res) => {
+  res.json({
+    ok: true,
+    WS_URL,
+    PLATFORM_ID,
+    HTTP_HOST,
+    ALLOW_ORIGIN: process.env.ALLOW_ORIGIN || null,
+    ATRIUN_LOGIN: process.env.ATRIUN_LOGIN ? '(set)' : '(missing)',
+    ATRIUN_PASSWORD: process.env.ATRIUN_PASSWORD ? '(set)' : '(missing)'
+  });
+});
+
+// ---------- Conectar ----------
 app.post('/connect', async (req, res) => {
   try {
     const { login, password, ssid } = req.body || {};
+
+    // valida envs antes
+    const miss = missing(['HTTP_HOST', 'WS_URL', 'PLATFORM_ID']);
+    if (miss.length) {
+      return res.status(500).json({ ok: false, error: 'missing_env', details: miss });
+    }
+
     if (ssid) {
       await connectWithSSID(ssid);
     } else {
@@ -97,31 +117,38 @@ app.post('/connect', async (req, res) => {
     }
     return res.json({ ok: true });
   } catch (e) {
+    // captura máximo de detalhes possíveis
     lastConnectError = e?.message || e;
-    console.error('[IaLife] connect error:', e);
-    return res.status(500).json({
+    const payload = {
       ok: false,
       error: e?.message || 'connect_failed',
-      // pode comentar a linha abaixo se não quiser detalhes no cliente:
-      details: e?.stack || String(e)
-    });
+      type: e?.constructor?.name || null,
+      code: e?.code || null
+    };
+    try {
+      if (e?.response) {
+        payload.httpStatus = e.response.status;
+        payload.httpStatusText = e.response.statusText;
+      }
+    } catch {}
+    console.error('[IaLife] connect error:', e);
+    return res.status(500).json(payload);
   }
 });
 
+// ---------- Pares abertos ----------
 app.get('/open-pairs', async (_req, res) => {
   if (!sdk) return res.status(400).json({ ok: false, error: 'not_connected' });
   try {
     const result = new Set();
     const now = sdk.currentTime ? sdk.currentTime() : Date.now();
 
-    // Digital
     try {
       const digital = await sdk.digitalOptions();
       const under = digital.getUnderlyingsAvailableForTradingAt(now);
       under.forEach(u => result.add(u.ticker || u.symbol || `ID:${u.activeId}`));
     } catch {}
 
-    // Blitz
     try {
       const blitz = await sdk.blitzOptions();
       blitz.getActives().forEach(a => {
@@ -129,7 +156,6 @@ app.get('/open-pairs', async (_req, res) => {
       });
     } catch {}
 
-    // Binary
     try {
       const binary = await sdk.binaryOptions();
       binary.getActives().forEach(a => {
