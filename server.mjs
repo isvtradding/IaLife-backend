@@ -1,16 +1,53 @@
+// server.mjs — IaLife backend (Express + Quadcode SDK)
+// Requisitos de env no Render (Environment):
+// ALLOW_ORIGIN="https://italosantanatrader.com,https://www.italosantanatrader.com"
+// ATRIUN_LOGIN, ATRIUN_PASSWORD
+// (opcionais com default) WS_URL, PLATFORM_ID, HTTP_HOST
+
 import express from 'express';
-import cors from 'cors';
 import dotenv from 'dotenv';
 import { ClientSdk, LoginPasswordAuthMethod, SsidAuthMethod } from '@quadcode-tech/client-sdk-js';
 
 dotenv.config();
 
 const app = express();
+
+/* ---------------------- CORS ROBUSTO ---------------------- */
+// Aceita várias origens, responde OPTIONS e evita o erro de wildcard + credentials.
+const allowed = (process.env.ALLOW_ORIGIN || '')
+  .split(',')
+  .map(s => s.trim())
+  .filter(Boolean); // ex.: ["https://italosantanatrader.com", "https://www.italosantanatrader.com"]
+
+app.use((req, res, next) => {
+  const origin = req.headers.origin;
+
+  // Se ALLOW_ORIGIN incluir '*', libera geral sem credenciais
+  if (allowed.includes('*')) {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    return next();
+  }
+
+  // Se a origem do request estiver na lista, reflete e permite credenciais
+  if (origin && allowed.includes(origin)) {
+    res.header('Access-Control-Allow-Origin', origin);
+    res.header('Vary', 'Origin');
+    res.header('Access-Control-Allow-Credentials', 'true');
+    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+    res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+  }
+
+  return next();
+});
+/* ---------------------------------------------------------- */
+
 app.use(express.json());
 
-const allow = process.env.ALLOW_ORIGIN ? process.env.ALLOW_ORIGIN.split(',') : ['*'];
-app.use(cors({ origin: allow, credentials: true }));
-
+// ---- Config da Atriun / Quadcode ----
 const WS_URL = process.env.WS_URL || 'wss://ws.trade.atriunbroker.finance/echo/websocket';
 const PLATFORM_ID = Number(process.env.PLATFORM_ID || 499);
 const HTTP_HOST = process.env.HTTP_HOST || 'https://trade.atriunbroker.finance';
@@ -18,56 +55,92 @@ const HTTP_HOST = process.env.HTTP_HOST || 'https://trade.atriunbroker.finance';
 let sdk = null;
 
 async function connectWithLogin(login, password) {
-  sdk = await ClientSdk.create(WS_URL, PLATFORM_ID, new LoginPasswordAuthMethod(HTTP_HOST, login, password), { host: HTTP_HOST });
+  sdk = await ClientSdk.create(
+    WS_URL,
+    PLATFORM_ID,
+    new LoginPasswordAuthMethod(HTTP_HOST, login, password),
+    { host: HTTP_HOST }
+  );
   return true;
 }
 
 async function connectWithSSID(ssid) {
-  sdk = await ClientSdk.create(WS_URL, PLATFORM_ID, new SsidAuthMethod(ssid), { host: HTTP_HOST });
+  sdk = await ClientSdk.create(
+    WS_URL,
+    PLATFORM_ID,
+    new SsidAuthMethod(ssid),
+    { host: HTTP_HOST }
+  );
   return true;
 }
 
-app.get('/', (req,res)=> res.json({ ok:true, message:'Cronos backend up' }));
+// ---------- Rotas ----------
+app.get('/', (_req, res) => {
+  res.json({ ok: true, message: 'IaLife backend up' });
+});
+
+app.get('/status', (_req, res) => {
+  res.json({ ok: true, connected: Boolean(sdk) });
+});
 
 app.post('/connect', async (req, res) => {
   try {
     const { login, password, ssid } = req.body || {};
-    if (ssid) await connectWithSSID(ssid);
-    else await connectWithLogin(login || process.env.ATRIUN_LOGIN, password || process.env.ATRIUN_PASSWORD);
+    if (ssid) {
+      await connectWithSSID(ssid);
+    } else {
+      const user = login || process.env.ATRIUN_LOGIN;
+      const pass = password || process.env.ATRIUN_PASSWORD;
+      if (!user || !pass) {
+        return res.status(400).json({ ok: false, error: 'missing_credentials' });
+      }
+      await connectWithLogin(user, pass);
+    }
     res.json({ ok: true });
   } catch (e) {
-    console.error('connect error', e);
-    res.status(500).json({ ok:false, error: e?.message || 'connect_failed'});
+    console.error('[IaLife] connect error:', e);
+    res.status(500).json({ ok: false, error: e?.message || 'connect_failed' });
   }
 });
 
-app.get('/open-pairs', async (req,res) => {
-  if (!sdk) return res.status(400).json({ ok:false, error: 'not_connected'});
-  try{
+app.get('/open-pairs', async (_req, res) => {
+  if (!sdk) return res.status(400).json({ ok: false, error: 'not_connected' });
+  try {
     const result = new Set();
     const now = sdk.currentTime ? sdk.currentTime() : Date.now();
-    // digital
+
+    // Digital
     try {
       const digital = await sdk.digitalOptions();
       const under = digital.getUnderlyingsAvailableForTradingAt(now);
       under.forEach(u => result.add(u.ticker || u.symbol || `ID:${u.activeId}`));
-    } catch(e){}
-    // blitz
+    } catch { /* ignore */ }
+
+    // Blitz
     try {
       const blitz = await sdk.blitzOptions();
-      blitz.getActives().forEach(a => { try{ if (a.canBeBoughtAt(now)) result.add(a.ticker || a.name || `ID:${a.id}`)} catch {} });
-    } catch(e){}
-    // binary
+      blitz.getActives().forEach(a => {
+        try { if (a.canBeBoughtAt(now)) result.add(a.ticker || a.name || `ID:${a.id}`); } catch {}
+      });
+    } catch { /* ignore */ }
+
+    // Binary
     try {
       const binary = await sdk.binaryOptions();
-      binary.getActives().forEach(a => { try{ if (a.canBeBoughtAt(now)) result.add(a.ticker || a.name || `ID:${a.id}`)} catch {} });
-    } catch(e){}
-    res.json({ ok:true, pairs: [...result].sort() });
-  } catch(e){
-    console.error('open-pairs error', e);
-    res.status(500).json({ok:false, error:e.message});
+      binary.getActives().forEach(a => {
+        try { if (a.canBeBoughtAt(now)) result.add(a.ticker || a.name || `ID:${a.id}`); } catch {}
+      });
+    } catch { /* ignore */ }
+
+    res.json({ ok: true, pairs: [...result].sort() });
+  } catch (e) {
+    console.error('[IaLife] /open-pairs error:', e);
+    res.status(500).json({ ok: false, error: e?.message || 'open_pairs_failed' });
   }
 });
 
+// ---------- Start ----------
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log('Cronos backend running on port', PORT));
+app.listen(PORT, () => {
+  console.log('IaLife backend running on port', PORT);
+});
