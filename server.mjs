@@ -1,5 +1,5 @@
 // server.mjs — IaLife backend (Express + Quadcode SDK)
-// Requisitos de env no Render (Environment):
+// ENV necessários no Render:
 // ALLOW_ORIGIN="https://italosantanatrader.com,https://www.italosantanatrader.com"
 // ATRIUN_LOGIN, ATRIUN_PASSWORD
 // (opcionais com default) WS_URL, PLATFORM_ID, HTTP_HOST
@@ -13,16 +13,13 @@ dotenv.config();
 const app = express();
 
 /* ---------------------- CORS ROBUSTO ---------------------- */
-// Aceita várias origens, responde OPTIONS e evita o erro de wildcard + credentials.
 const allowed = (process.env.ALLOW_ORIGIN || '')
   .split(',')
   .map(s => s.trim())
-  .filter(Boolean); // ex.: ["https://italosantanatrader.com", "https://www.italosantanatrader.com"]
+  .filter(Boolean);
 
 app.use((req, res, next) => {
   const origin = req.headers.origin;
-
-  // Se ALLOW_ORIGIN incluir '*', libera geral sem credenciais
   if (allowed.includes('*')) {
     res.header('Access-Control-Allow-Origin', '*');
     res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -30,8 +27,6 @@ app.use((req, res, next) => {
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     return next();
   }
-
-  // Se a origem do request estiver na lista, reflete e permite credenciais
   if (origin && allowed.includes(origin)) {
     res.header('Access-Control-Allow-Origin', origin);
     res.header('Vary', 'Origin');
@@ -40,7 +35,6 @@ app.use((req, res, next) => {
     res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
     if (req.method === 'OPTIONS') return res.sendStatus(204);
   }
-
   return next();
 });
 /* ---------------------------------------------------------- */
@@ -53,8 +47,10 @@ const PLATFORM_ID = Number(process.env.PLATFORM_ID || 499);
 const HTTP_HOST = process.env.HTTP_HOST || 'https://trade.atriunbroker.finance';
 
 let sdk = null;
+let lastConnectError = null;
 
 async function connectWithLogin(login, password) {
+  lastConnectError = null;
   sdk = await ClientSdk.create(
     WS_URL,
     PLATFORM_ID,
@@ -65,6 +61,7 @@ async function connectWithLogin(login, password) {
 }
 
 async function connectWithSSID(ssid) {
+  lastConnectError = null;
   sdk = await ClientSdk.create(
     WS_URL,
     PLATFORM_ID,
@@ -75,12 +72,14 @@ async function connectWithSSID(ssid) {
 }
 
 // ---------- Rotas ----------
-app.get('/', (_req, res) => {
-  res.json({ ok: true, message: 'IaLife backend up' });
-});
+app.get('/', (_req, res) => res.json({ ok: true, message: 'IaLife backend up' }));
 
 app.get('/status', (_req, res) => {
-  res.json({ ok: true, connected: Boolean(sdk) });
+  res.json({
+    ok: true,
+    connected: Boolean(sdk),
+    lastError: lastConnectError ? String(lastConnectError) : null
+  });
 });
 
 app.post('/connect', async (req, res) => {
@@ -96,10 +95,16 @@ app.post('/connect', async (req, res) => {
       }
       await connectWithLogin(user, pass);
     }
-    res.json({ ok: true });
+    return res.json({ ok: true });
   } catch (e) {
+    lastConnectError = e?.message || e;
     console.error('[IaLife] connect error:', e);
-    res.status(500).json({ ok: false, error: e?.message || 'connect_failed' });
+    return res.status(500).json({
+      ok: false,
+      error: e?.message || 'connect_failed',
+      // pode comentar a linha abaixo se não quiser detalhes no cliente:
+      details: e?.stack || String(e)
+    });
   }
 });
 
@@ -114,7 +119,7 @@ app.get('/open-pairs', async (_req, res) => {
       const digital = await sdk.digitalOptions();
       const under = digital.getUnderlyingsAvailableForTradingAt(now);
       under.forEach(u => result.add(u.ticker || u.symbol || `ID:${u.activeId}`));
-    } catch { /* ignore */ }
+    } catch {}
 
     // Blitz
     try {
@@ -122,7 +127,7 @@ app.get('/open-pairs', async (_req, res) => {
       blitz.getActives().forEach(a => {
         try { if (a.canBeBoughtAt(now)) result.add(a.ticker || a.name || `ID:${a.id}`); } catch {}
       });
-    } catch { /* ignore */ }
+    } catch {}
 
     // Binary
     try {
@@ -130,7 +135,7 @@ app.get('/open-pairs', async (_req, res) => {
       binary.getActives().forEach(a => {
         try { if (a.canBeBoughtAt(now)) result.add(a.ticker || a.name || `ID:${a.id}`); } catch {}
       });
-    } catch { /* ignore */ }
+    } catch {}
 
     res.json({ ok: true, pairs: [...result].sort() });
   } catch (e) {
@@ -139,8 +144,5 @@ app.get('/open-pairs', async (_req, res) => {
   }
 });
 
-// ---------- Start ----------
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log('IaLife backend running on port', PORT);
-});
+app.listen(PORT, () => console.log('IaLife backend running on port', PORT));
