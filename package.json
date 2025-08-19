@@ -8,10 +8,10 @@
     "start": "node server.mjs"
   },
   "dependencies": {
-    "@quadcode-tech/client-sdk-js": "^5.4.0",
+   "@quadcode-tech/client-sdk-js": "github:quadcode/client-sdk-js#main",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
-    "express": "^4.18.2"
+    "express": "^4.18.2
   },
   "engines": {
     "node": ">=18"
