@@ -1,33 +1,11 @@
-// server.mjs — IaLife Backend (Express + SSE) com estratégia SMA-20
-// - Conecta no SDK da Quadcode (Atriun) usando ClientSdk.create
-// - Assina quotes de até 10 "actives" compráveis agora (Blitz Options)
-// - Gera sinais quando o preço cruza a SMA-20 (compra pra cima, venda pra baixo)
-// - Probabilidade calculada pela distância ao SMA (40–90) e NUNCA < 40
-// - SSE em /events para o frontend (event: signal)
-//
-// Endpoints:
-//  GET  /status
-//  POST /connect
-//  POST /disconnect
-//  GET  /open-pairs
-//  GET  /events
-//
-// Variáveis de ambiente (Render):
-//  WS_URL=wss://ws.trade.atriunbroker.finance/echo/websocket
-//  HTTP_HOST=https://api.trade.atriunbroker.finance
-//  PLATFORM_ID=499
-//  ATRIUN_LOGIN=atriun.baseapi@gmail.com
-//  ATRIUN_PASSWORD=Atriun@33225608
-//  ALLOW_ORIGIN=https://italosantanatrader.com,https://www.italosantanatrader.com
-//  DEMO_MODE=0   (opcional: 1 para forçar demo)
-//
+// server.mjs — IaLife Backend (SMA-20 + Lock + Filtro Binary/Digital + SSE)
 import express from 'express';
 import cors from 'cors';
 
 const app = express();
 app.use(express.json());
 
-// --------- CORS ---------
+// -------- CORS --------
 const allowOriginEnv = process.env.ALLOW_ORIGIN || '';
 const allowed = allowOriginEnv.split(',').map(s => s.trim()).filter(Boolean);
 app.use((req, res, next) => {
@@ -43,111 +21,111 @@ app.use((req, res, next) => {
 });
 
 const PORT = process.env.PORT || 3000;
+const SIGNAL_COOLDOWN_MS   = 2 * 60 * 1000;                    // intervalo entre sinais por ativo
+const SIGNAL_HOLD_MS       = parseInt(process.env.SIGNAL_HOLD_MS || '70000', 10); // "operação em andamento"
+const MAX_QUOTE_ACTIVES    = 10;                                // no máximo 10 ativos assinados
 
-// --------- Estado ---------
-let SDKModule = null;   // módulo importado
-let sdk = null;         // instância ClientSdk
+// -------- Estado --------
+let SDKModule = null;
+let sdk = null;
 let connected = false;
 let lastError = null;
 let demoMode = (process.env.DEMO_MODE || '').trim() === '1';
-let pairsCache = [];    // nomes (tickers) dos ativos abertos
+let pairsCache = [];                    // lista exposta ao front (BIN+DIGI)
+let allowedTickersSet = new Set();      // tickers válidos (BINÁRIO/DIGITAL)
 let demoTimer = null;
 
-// --------- SSE ---------
+// "lock" de operação: só permite novo sinal após terminar a anterior
+let tradeLock = { locked:false, active:null, activeId:null, openedAt:0, expiresAt:0 };
+
+// -------- SSE --------
 const sseClients = new Set();
 const SSE_PING_MS = 15000;
+function sseSend(res, payload, eventName='message'){ res.write(`event: ${eventName}\n`); res.write(`data: ${JSON.stringify(payload)}\n\n`); }
+function broadcastSignal(sig){ for (const r of sseClients) { try{ sseSend(r, sig, 'signal'); }catch{} } }
+setInterval(()=>{ for (const r of sseClients){ try{ sseSend(r, { t: Date.now() }, 'ping'); }catch{} } }, SSE_PING_MS);
 
-function sseSend(res, payload, eventName='message') {
-  res.write(`event: ${eventName}\n`);
-  res.write(`data: ${JSON.stringify(payload)}\n\n`);
-}
-function broadcastSignal(signal) {
-  for (const res of sseClients) {
-    try { sseSend(res, signal, 'signal'); } catch {}
+// -------- Utils --------
+const log=(...a)=>console.log('[IaLife]',...a);
+const errlog=(...a)=>console.error('[IaLife][ERR]',...a);
+function envView(){ return { WS_URL:process.env.WS_URL, HTTP_HOST:process.env.HTTP_HOST, PLATFORM_ID:process.env.PLATFORM_ID, ALLOW_ORIGIN:allowOriginEnv, DEMO_MODE: demoMode?'1':'0', SIGNAL_HOLD_MS, ATRIUN_LOGIN: process.env.ATRIUN_LOGIN?'(set)':'(unset)', ATRIUN_PASSWORD: process.env.ATRIUN_PASSWORD?'(set)':'(unset)' }; }
+
+// SMA / buffers
+const priceBuffers = new Map(); // activeId -> number[]
+const lastSignalAt = new Map(); // activeId -> timestamp
+function sma(arr, len){ if (!arr || arr.length < len) return null; let s=0; for (let i=arr.length-len;i<arr.length;i++) s+=arr[i]; return s/len; }
+function pushPrice(activeId, price, maxLen=50){ const buf=priceBuffers.get(activeId)||[]; buf.push(price); if (buf.length>maxLen) buf.shift(); priceBuffers.set(activeId, buf); return buf; }
+function probFromDistance(p, avg){ const dist = Math.abs((p-avg)/avg); let base = 40 + Math.min(50, Math.round(dist*10000)); if (base>90) base=90; if (base<40) base=40; return base; }
+
+function maybeReleaseTradeLock(){
+  if (tradeLock.locked && Date.now() >= tradeLock.expiresAt){
+    tradeLock = { locked:false, active:null, activeId:null, openedAt:0, expiresAt:0 };
+    log('Trade lock liberado por tempo.');
   }
 }
-setInterval(() => {
-  for (const res of sseClients) {
-    try { sseSend(res, { t: Date.now() }, 'ping'); } catch {}
-  }
-}, SSE_PING_MS);
-
-// --------- Utils ---------
-function log(...a){ console.log('[IaLife]', ...a); }
-function errlog(...a){ console.error('[IaLife][ERR]', ...a); }
-function envView(){
-  return {
-    WS_URL: process.env.WS_URL,
-    HTTP_HOST: process.env.HTTP_HOST,
-    PLATFORM_ID: process.env.PLATFORM_ID,
-    ALLOW_ORIGIN: allowOriginEnv,
-    DEMO_MODE: demoMode ? '1' : '0',
-    ATRIUN_LOGIN: process.env.ATRIUN_LOGIN ? '(set)' : '(unset)',
-    ATRIUN_PASSWORD: process.env.ATRIUN_PASSWORD ? '(set)' : '(unset)',
-  };
+function acquireTradeLock(name, id){
+  tradeLock = { locked:true, active:name, activeId:id, openedAt:Date.now(), expiresAt: Date.now()+SIGNAL_HOLD_MS };
+  log('Trade lock ativado para', name, 'até', new Date(tradeLock.expiresAt).toISOString());
 }
 
-// --------- SMA + buffer + cooldown ---------
-const priceBuffers = new Map();    // activeId -> number[]
-const lastSignalAt = new Map();    // activeId -> timestamp
-const SIGNAL_COOLDOWN_MS = 2 * 60 * 1000; // 2 min
-
-function sma(arr, len) {
-  if (!Array.isArray(arr) || arr.length < len) return null;
-  let sum = 0;
-  for (let i = arr.length - len; i < arr.length; i++) sum += arr[i];
-  return sum / len;
-}
-function pushPrice(activeId, price, maxLen = 50) {
-  const buf = priceBuffers.get(activeId) || [];
-  buf.push(price);
-  if (buf.length > maxLen) buf.shift();
-  priceBuffers.set(activeId, buf);
-  return buf;
-}
-function probFromDistance(p, avg) {
-  const dist = Math.abs((p - avg) / avg);   // 0.001 = 0.1%
-  let base = 40 + Math.min(50, Math.round(dist * 10000)); // 0.1% => +10
-  if (base > 90) base = 90;
-  if (base < 40) base = 40;
-  return base;
-}
-
-// --------- SDK Loader ---------
+// -------- SDK --------
 async function loadSdkIfPossible(){
   if (SDKModule || demoMode) return !!SDKModule;
-  try {
-    SDKModule = await import('@quadcode-tech/client-sdk-js');
-    log('Quadcode SDK importado.');
-    return true;
-  } catch(e){
-    demoMode = true;
-    lastError = 'sdk_import_failed';
-    errlog('Falha no import do SDK → DEMO_MODE', e?.message || e);
-    return false;
-  }
+  try { SDKModule = await import('@quadcode-tech/client-sdk-js'); log('Quadcode SDK importado.'); return true; }
+  catch(e){ demoMode=true; lastError='sdk_import_failed'; errlog('Falha import SDK → DEMO', e?.message || e); return false; }
 }
 
-// --------- Assinatura de quotes e geração de sinais ---------
-async function wireQuoteSignals(currentSdk, pairsTargetArray) {
+// Tenta buscar tickers abertos de BINÁRIO e DIGITAL
+async function loadBinaryDigitalTickers(currentSdk){
+  const all = new Set();
+  const now = currentSdk.currentTime ? currentSdk.currentTime() : new Date();
+
+  const sources = [
+    { name:'binary',  getter: () => currentSdk.binaryOptions?.() },
+    { name:'digital', getter: () => currentSdk.digitalOptions?.() },
+  ];
+
+  for (const src of sources){
+    try{
+      const m = await src.getter();
+      if (m && typeof m.getActives === 'function'){
+        const actives = m.getActives().filter(a => a.canBeBoughtAt(now));
+        for (const a of actives){
+          const ticker = a.ticker || (`ACTIVE_${a.id}`);
+          all.add(ticker);
+        }
+        log(`Ativos ${src.name}:`, actives.length);
+      } else {
+        log(`Fonte ${src.name} indisponível no SDK.`);
+      }
+    }catch(e){
+      errlog(`Erro lendo ${src.name}:`, e?.message || e);
+    }
+  }
+
+  return all;
+}
+
+// Assina quotes via Blitz Options (para cálculo do SMA), mas só gera sinal se ticker ∈ allowedTickersSet e se não estiver lockado
+async function wireQuoteSignals(currentSdk){
   const quotes = await currentSdk.quotes();
   const bo = await currentSdk.blitzOptions();
   const now = currentSdk.currentTime ? currentSdk.currentTime() : new Date();
+  const actives = bo.getActives().filter(a => a.canBeBoughtAt(now));
 
-  // Seleciona até 10 ativos "compráveis agora"
-  const actives = bo.getActives().filter(a => a.canBeBoughtAt(now)).slice(0, 10);
-  const names = actives.map(a => a.ticker || (`ACTIVE_${a.id}`));
-  if (Array.isArray(pairsTargetArray)) {
-    pairsTargetArray.splice(0, pairsTargetArray.length, ...names);
-  }
+  // Filtra para os que estão abertos em BIN/DIGI
+  const filtered = actives.filter(a => allowedTickersSet.has(a.ticker || (`ACTIVE_${a.id}`))).slice(0, MAX_QUOTE_ACTIVES);
+  log('Assinando quotes para', filtered.length, 'ativos (interseção Blitz ∩ {Binary,Digital})');
 
-  for (const a of actives) {
+  for (const a of filtered){
     const activeId = a.id;
     const name = a.ticker || (`ACTIVE_${a.id}`);
     const cq = await quotes.getCurrentQuoteForActive(activeId);
 
     cq.subscribeOnUpdate((updated) => {
-      // Normaliza possíveis campos de preço
+      maybeReleaseTradeLock(); // libera por tempo se necessário
+      if (tradeLock.locked) return; // há operação em andamento
+
       const price = updated?.quote ?? updated?.value ?? updated?.ask ?? updated?.bid;
       if (typeof price !== 'number') return;
 
@@ -166,19 +144,26 @@ async function wireQuoteSignals(currentSdk, pairsTargetArray) {
       if (!crossedUp && !crossedDown) return;
 
       lastSignalAt.set(activeId, Date.now());
+
+      // Só emite se o par continua permitido
+      if (!allowedTickersSet.has(name)) return;
+
+      // Aplica lock (aguarda fim da "operação")
+      acquireTradeLock(name, activeId);
+
       const ordem = crossedUp ? 'COMPRA' : 'VENDA';
       const prob  = probFromDistance(price, avg);
       const h = new Date();
       const horario = `${String(h.getHours()).padStart(2,'0')}:${String(h.getMinutes()).padStart(2,'0')}`;
 
-      broadcastSignal({ ativo: name, timeframe: 'M1', ordem, horario, prob });
+      broadcastSignal({ ativo:name, timeframe:'M1', ordem, horario, prob });
     });
   }
 
-  log('wireQuoteSignals: assinaturas ativas em', actives.length, 'ativos');
+  // Atualiza pairsCache para UI
+  pairsCache = filtered.map(a => a.ticker || (`ACTIVE_${a.id}`));
 }
 
-// --------- Conexões ---------
 async function connectReal(){
   await loadSdkIfPossible();
   if (!SDKModule) return { ok:false, error:'sdk_unavailable' };
@@ -196,31 +181,28 @@ async function connectReal(){
   if (!PLATFORM_ID) missing.push('PLATFORM_ID');
   if (!LOGIN) missing.push('ATRIUN_LOGIN');
   if (!PASSWORD) missing.push('ATRIUN_PASSWORD');
-  if (missing.length){
-    lastError = 'missing_env:' + missing.join(',');
-    return { ok:false, error:lastError };
-  }
+  if (missing.length){ lastError = 'missing_env:' + missing.join(','); return { ok:false, error:lastError }; }
 
   try{
-    sdk = await ClientSdk.create(
-      WS_URL,
-      PLATFORM_ID,
-      new LoginPasswordAuthMethod(HTTP_HOST, LOGIN, PASSWORD)
-    );
+    sdk = await ClientSdk.create(WS_URL, PLATFORM_ID, new LoginPasswordAuthMethod(HTTP_HOST, LOGIN, PASSWORD));
+    connected = true; lastError = null; log('Conectado (real).');
 
-    connected = true;
-    lastError = null;
-    log('Conectado (real).');
+    // 1) carrega os tickers permitidos (BINÁRIO + DIGITAL)
+    allowedTickersSet = await loadBinaryDigitalTickers(sdk);
+    log('Tickers permitidos (BIN/DIGI):', allowedTickersSet.size);
 
-    // Carrega e assina quotes → sinais SMA-20
-    await wireQuoteSignals(sdk, pairsCache);
+    if (allowedTickersSet.size === 0){
+      log('Nenhum par binário/digital aberto — sinais serão pausados.');
+      pairsCache = [];
+      return { ok:true, note:'no_binary_digital_open' };
+    }
+
+    // 2) assina quotes (via Blitz) e gera sinais SOMENTE para os tickers permitidos
+    await wireQuoteSignals(sdk);
 
     return { ok:true };
   }catch(e){
-    connected = false;
-    lastError = 'connect_failed:' + (e?.message || String(e));
-    errlog('Erro conectar (real):', e);
-    return { ok:false, error:lastError };
+    connected=false; lastError='connect_failed:'+(e?.message || String(e)); errlog('Erro conectar (real):', e); return { ok:false, error:lastError };
   }
 }
 
@@ -228,12 +210,18 @@ function startDemoTicker(){
   stopDemoTicker();
   demoTimer = setInterval(()=>{
     if (!connected) return;
-    const ativos = pairsCache.length ? pairsCache : ['EUR/USD','GBP/USD','USD/JPY','EUR/JPY','AUD/USD','NZD/USD'];
-    const ativo = ativos[Math.floor(Math.random()*ativos.length)];
+    maybeReleaseTradeLock();
+    if (tradeLock.locked) return;
+
+    const allowed = Array.from(allowedTickersSet);
+    const base = allowed.length ? allowed : (pairsCache.length ? pairsCache : ['EUR/USD','GBP/USD','USD/JPY']);
+    const ativo = base[Math.floor(Math.random()*base.length)];
     const now = new Date();
     const h = String(now.getHours()).padStart(2,'0');
     const m = String(now.getMinutes()).padStart(2,'0');
     const prob = 58 + Math.floor(Math.random()*29);
+
+    acquireTradeLock(ativo, null);
     broadcastSignal({ ativo, timeframe:'M1', ordem: Math.random()>0.5?'COMPRA':'VENDA', horario:`${h}:${m}`, prob });
   }, 20000);
   log('Demo ticker iniciado.');
@@ -241,53 +229,42 @@ function startDemoTicker(){
 function stopDemoTicker(){ if (demoTimer){ clearInterval(demoTimer); demoTimer=null; log('Demo ticker parado.'); } }
 
 async function connectDemo(){
-  connected = true;
-  lastError = null;
-  if (!pairsCache.length) pairsCache = ['EUR/USD','GBP/USD','USD/JPY','EUR/JPY','AUD/USD','NZD/USD'];
+  connected = true; lastError = null;
+  // Mantém somente bin/digi se existir; se vazio, usa alguns padrões
+  if (allowedTickersSet.size === 0) {
+    allowedTickersSet = new Set(['EUR/USD','GBP/USD','USD/JPY']);
+  }
+  pairsCache = Array.from(allowedTickersSet);
   startDemoTicker();
   return { ok:true, demo:true };
 }
 
-// --------- Rotas ---------
+// -------- Rotas --------
 app.get('/status', (req,res)=>{
-  res.json({ ok:true, connected, lastError, env: envView() });
+  res.json({ ok:true, connected, lastError, lock: tradeLock, pairs: pairsCache, env: envView() });
 });
 
 app.post('/connect', async (req,res)=>{
-  if (connected) return res.json({ ok:true, already:true, demo: demoMode });
+  if (connected) return res.json({ ok:true, already:true, demo: demoMode, lock: tradeLock });
   const result = demoMode ? await connectDemo() : await connectReal();
-  // Fallback para DEMO se a conexão real falhar (facilita teste)
-  if (!result.ok) {
-    const fallback = await connectDemo();
-    return res.json({ ...fallback, fallbackFrom: result.error || 'unknown' });
+  if (!result.ok) { // fallback demo
+    const fb = await connectDemo();
+    return res.json({ ...fb, fallbackFrom: result.error || 'unknown' });
   }
-  return res.json(result);
+  return res.json({ ...result, lock: tradeLock });
 });
 
 app.post('/disconnect', (req,res)=>{
-  connected = false;
-  lastError = null;
+  connected=false; lastError=null;
   if (sdk?.disconnect) try{ sdk.disconnect(); }catch{}
-  sdk = null;
-  stopDemoTicker();
+  sdk=null; stopDemoTicker();
+  tradeLock = { locked:false, active:null, activeId:null, openedAt:0, expiresAt:0 };
   res.json({ ok:true });
 });
 
 app.get('/open-pairs', async (req,res)=>{
   if (!connected) return res.status(400).json({ ok:false, error:'not_connected' });
-  if (!demoMode && sdk){
-    try{
-      const bo = await sdk.blitzOptions();
-      const now = sdk.currentTime ? sdk.currentTime() : new Date();
-      const actives = bo.getActives().filter(a => a.canBeBoughtAt(now));
-      const names = actives.map(a => a.ticker || (`ACTIVE_${a.id}`));
-      pairsCache = names.slice();
-      return res.json({ ok:true, pairs: pairsCache });
-    }catch(e){
-      lastError = 'pairs_failed:' + (e?.message || e);
-      return res.status(500).json({ ok:false, error:lastError });
-    }
-  }
+  // Retorna os pares "permitidos" (BIN+DIGI)
   return res.json({ ok:true, pairs: pairsCache });
 });
 
@@ -298,15 +275,9 @@ app.get('/events', (req,res)=>{
   sseClients.add(res);
   log('SSE client +1 total:', sseClients.size);
   sseSend(res, { t: Date.now(), connected }, 'ping');
-  req.on('close', ()=>{
-    sseClients.delete(res);
-    log('SSE client -1 total:', sseClients.size);
-    try{ res.end(); }catch{}
-  });
+  req.on('close', ()=>{ sseClients.delete(res); log('SSE client -1 total:', sseClients.size); try{ res.end(); }catch{} });
 });
 
 app.get('/', (req,res)=> res.json({ ok:true, service:'IaLife Backend', connected, lastError }) );
 
-app.listen(PORT, ()=>{
-  log(`Servidor ouvindo :${PORT}`, envView());
-});
+app.listen(PORT, ()=>{ log(`Servidor ouvindo :${PORT}`, envView()); });
