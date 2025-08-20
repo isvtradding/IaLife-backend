@@ -1,11 +1,33 @@
-// server.mjs — IaLife Backend (Express + SSE) — FIXED to use ClientSdk.create
+// server.mjs — IaLife Backend (Express + SSE) com estratégia SMA-20
+// - Conecta no SDK da Quadcode (Atriun) usando ClientSdk.create
+// - Assina quotes de até 10 "actives" compráveis agora (Blitz Options)
+// - Gera sinais quando o preço cruza a SMA-20 (compra pra cima, venda pra baixo)
+// - Probabilidade calculada pela distância ao SMA (40–90) e NUNCA < 40
+// - SSE em /events para o frontend (event: signal)
+//
+// Endpoints:
+//  GET  /status
+//  POST /connect
+//  POST /disconnect
+//  GET  /open-pairs
+//  GET  /events
+//
+// Variáveis de ambiente (Render):
+//  WS_URL=wss://ws.trade.atriunbroker.finance/echo/websocket
+//  HTTP_HOST=https://api.trade.atriunbroker.finance
+//  PLATFORM_ID=499
+//  ATRIUN_LOGIN=atriun.baseapi@gmail.com
+//  ATRIUN_PASSWORD=Atriun@33225608
+//  ALLOW_ORIGIN=https://italosantanatrader.com,https://www.italosantanatrader.com
+//  DEMO_MODE=0   (opcional: 1 para forçar demo)
+//
 import express from 'express';
 import cors from 'cors';
 
 const app = express();
 app.use(express.json());
 
-// --- CORS ---
+// --------- CORS ---------
 const allowOriginEnv = process.env.ALLOW_ORIGIN || '';
 const allowed = allowOriginEnv.split(',').map(s => s.trim()).filter(Boolean);
 app.use((req, res, next) => {
@@ -22,16 +44,16 @@ app.use((req, res, next) => {
 
 const PORT = process.env.PORT || 3000;
 
-// --- State ---
-let SDK = null;         // module
-let sdk = null;         // ClientSdk instance
+// --------- Estado ---------
+let SDKModule = null;   // módulo importado
+let sdk = null;         // instância ClientSdk
 let connected = false;
 let lastError = null;
 let demoMode = (process.env.DEMO_MODE || '').trim() === '1';
-let pairsCache = [];
+let pairsCache = [];    // nomes (tickers) dos ativos abertos
 let demoTimer = null;
 
-// --- SSE ---
+// --------- SSE ---------
 const sseClients = new Set();
 const SSE_PING_MS = 15000;
 
@@ -50,39 +72,118 @@ setInterval(() => {
   }
 }, SSE_PING_MS);
 
-// --- Utils ---
-const log = (...a)=>console.log('[IaLife]', ...a);
-const errlog = (...a)=>console.error('[IaLife][ERR]', ...a);
-const envView = ()=>({
-  WS_URL: process.env.WS_URL,
-  HTTP_HOST: process.env.HTTP_HOST,
-  PLATFORM_ID: process.env.PLATFORM_ID,
-  ALLOW_ORIGIN: allowOriginEnv,
-  DEMO_MODE: demoMode ? '1' : '0',
-  ATRIUN_LOGIN: process.env.ATRIUN_LOGIN ? '(set)' : '(unset)',
-  ATRIUN_PASSWORD: process.env.ATRIUN_PASSWORD ? '(set)' : '(unset)',
-});
+// --------- Utils ---------
+function log(...a){ console.log('[IaLife]', ...a); }
+function errlog(...a){ console.error('[IaLife][ERR]', ...a); }
+function envView(){
+  return {
+    WS_URL: process.env.WS_URL,
+    HTTP_HOST: process.env.HTTP_HOST,
+    PLATFORM_ID: process.env.PLATFORM_ID,
+    ALLOW_ORIGIN: allowOriginEnv,
+    DEMO_MODE: demoMode ? '1' : '0',
+    ATRIUN_LOGIN: process.env.ATRIUN_LOGIN ? '(set)' : '(unset)',
+    ATRIUN_PASSWORD: process.env.ATRIUN_PASSWORD ? '(set)' : '(unset)',
+  };
+}
 
-// --- SDK loader ---
+// --------- SMA + buffer + cooldown ---------
+const priceBuffers = new Map();    // activeId -> number[]
+const lastSignalAt = new Map();    // activeId -> timestamp
+const SIGNAL_COOLDOWN_MS = 2 * 60 * 1000; // 2 min
+
+function sma(arr, len) {
+  if (!Array.isArray(arr) || arr.length < len) return null;
+  let sum = 0;
+  for (let i = arr.length - len; i < arr.length; i++) sum += arr[i];
+  return sum / len;
+}
+function pushPrice(activeId, price, maxLen = 50) {
+  const buf = priceBuffers.get(activeId) || [];
+  buf.push(price);
+  if (buf.length > maxLen) buf.shift();
+  priceBuffers.set(activeId, buf);
+  return buf;
+}
+function probFromDistance(p, avg) {
+  const dist = Math.abs((p - avg) / avg);   // 0.001 = 0.1%
+  let base = 40 + Math.min(50, Math.round(dist * 10000)); // 0.1% => +10
+  if (base > 90) base = 90;
+  if (base < 40) base = 40;
+  return base;
+}
+
+// --------- SDK Loader ---------
 async function loadSdkIfPossible(){
-  if (SDK || demoMode) return !!SDK;
+  if (SDKModule || demoMode) return !!SDKModule;
   try {
-    SDK = await import('@quadcode-tech/client-sdk-js');
+    SDKModule = await import('@quadcode-tech/client-sdk-js');
     log('Quadcode SDK importado.');
     return true;
   } catch(e){
     demoMode = true;
     lastError = 'sdk_import_failed';
-    errlog('Falha import SDK → DEMO_MODE', e?.message || e);
+    errlog('Falha no import do SDK → DEMO_MODE', e?.message || e);
     return false;
   }
 }
 
+// --------- Assinatura de quotes e geração de sinais ---------
+async function wireQuoteSignals(currentSdk, pairsTargetArray) {
+  const quotes = await currentSdk.quotes();
+  const bo = await currentSdk.blitzOptions();
+  const now = currentSdk.currentTime ? currentSdk.currentTime() : new Date();
+
+  // Seleciona até 10 ativos "compráveis agora"
+  const actives = bo.getActives().filter(a => a.canBeBoughtAt(now)).slice(0, 10);
+  const names = actives.map(a => a.ticker || (`ACTIVE_${a.id}`));
+  if (Array.isArray(pairsTargetArray)) {
+    pairsTargetArray.splice(0, pairsTargetArray.length, ...names);
+  }
+
+  for (const a of actives) {
+    const activeId = a.id;
+    const name = a.ticker || (`ACTIVE_${a.id}`);
+    const cq = await quotes.getCurrentQuoteForActive(activeId);
+
+    cq.subscribeOnUpdate((updated) => {
+      // Normaliza possíveis campos de preço
+      const price = updated?.quote ?? updated?.value ?? updated?.ask ?? updated?.bid;
+      if (typeof price !== 'number') return;
+
+      const buf = pushPrice(activeId, price);
+      const avg = sma(buf, 20);
+      if (!avg) return;
+
+      const lastAt = lastSignalAt.get(activeId) || 0;
+      if (Date.now() - lastAt < SIGNAL_COOLDOWN_MS) return;
+
+      const prev = buf[buf.length - 2];
+      if (typeof prev !== 'number') return;
+
+      const crossedUp   = prev < avg && price > avg;
+      const crossedDown = prev > avg && price < avg;
+      if (!crossedUp && !crossedDown) return;
+
+      lastSignalAt.set(activeId, Date.now());
+      const ordem = crossedUp ? 'COMPRA' : 'VENDA';
+      const prob  = probFromDistance(price, avg);
+      const h = new Date();
+      const horario = `${String(h.getHours()).padStart(2,'0')}:${String(h.getMinutes()).padStart(2,'0')}`;
+
+      broadcastSignal({ ativo: name, timeframe: 'M1', ordem, horario, prob });
+    });
+  }
+
+  log('wireQuoteSignals: assinaturas ativas em', actives.length, 'ativos');
+}
+
+// --------- Conexões ---------
 async function connectReal(){
   await loadSdkIfPossible();
-  if (!SDK) return { ok:false, error:'sdk_unavailable' };
+  if (!SDKModule) return { ok:false, error:'sdk_unavailable' };
 
-  const { ClientSdk, LoginPasswordAuthMethod } = SDK;
+  const { ClientSdk, LoginPasswordAuthMethod } = SDKModule;
   const WS_URL = process.env.WS_URL;
   const HTTP_HOST = process.env.HTTP_HOST;
   const PLATFORM_ID = Number(process.env.PLATFORM_ID || '0');
@@ -101,33 +202,18 @@ async function connectReal(){
   }
 
   try{
-    // Conforme README do SDK (npm): ClientSdk.create(ws, platformId, new LoginPasswordAuthMethod(apiHost, login, pwd), { host? })
     sdk = await ClientSdk.create(
       WS_URL,
       PLATFORM_ID,
       new LoginPasswordAuthMethod(HTTP_HOST, LOGIN, PASSWORD)
-      // , { host: 'https://trade.atriunbroker.finance' } // opcional
     );
 
     connected = true;
     lastError = null;
-    log('Conectado (real)');
+    log('Conectado (real).');
 
-    // Carrega "pares abertos" com base em Blitz Options que podem ser comprados agora
-    try{
-      const bo = await sdk.blitzOptions();
-      const now = sdk.currentTime ? sdk.currentTime() : new Date();
-      const actives = bo.getActives().filter(a => a.canBeBoughtAt(now));
-      // use ticker (quando houver) ou id
-      pairsCache = actives.map(a => a.ticker || (`ACTIVE_${a.id}`));
-      log('Pairs/Actives abertos:', pairsCache.length);
-    }catch(e){
-      errlog('Falha ao obter actives:', e?.message || e);
-    }
-
-    // Aqui você pode assinar eventos reais (ex.: posições, quotes) se o SDK expuser:
-    // const positions = await sdk.positions();
-    // positions.subscribeOnUpdatePosition((pos) => { ...broadcastSignal(...) });
+    // Carrega e assina quotes → sinais SMA-20
+    await wireQuoteSignals(sdk, pairsCache);
 
     return { ok:true };
   }catch(e){
@@ -162,7 +248,7 @@ async function connectDemo(){
   return { ok:true, demo:true };
 }
 
-// --- Routes ---
+// --------- Rotas ---------
 app.get('/status', (req,res)=>{
   res.json({ ok:true, connected, lastError, env: envView() });
 });
@@ -170,7 +256,7 @@ app.get('/status', (req,res)=>{
 app.post('/connect', async (req,res)=>{
   if (connected) return res.json({ ok:true, already:true, demo: demoMode });
   const result = demoMode ? await connectDemo() : await connectReal();
-  // Fallback para DEMO se falhar por qualquer motivo (facilita teste)
+  // Fallback para DEMO se a conexão real falhar (facilita teste)
   if (!result.ok) {
     const fallback = await connectDemo();
     return res.json({ ...fallback, fallbackFrom: result.error || 'unknown' });
@@ -194,7 +280,8 @@ app.get('/open-pairs', async (req,res)=>{
       const bo = await sdk.blitzOptions();
       const now = sdk.currentTime ? sdk.currentTime() : new Date();
       const actives = bo.getActives().filter(a => a.canBeBoughtAt(now));
-      pairsCache = actives.map(a => a.ticker || (`ACTIVE_${a.id}`));
+      const names = actives.map(a => a.ticker || (`ACTIVE_${a.id}`));
+      pairsCache = names.slice();
       return res.json({ ok:true, pairs: pairsCache });
     }catch(e){
       lastError = 'pairs_failed:' + (e?.message || e);
