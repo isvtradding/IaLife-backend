@@ -1,20 +1,31 @@
-// server.mjs — IaLife Backend (janela: -30s/+60s; inverte ordem; resultado na mesma vela)
+// server.mjs — IaLife Backend v2.0
 import express from 'express';
 import cors from 'cors';
 
 const app = express();
 app.use(express.json());
 
-// ===== Config =====
 const DISPLAY_TZ = process.env.DISPLAY_TZ || 'America/Sao_Paulo';
 const PORT = process.env.PORT || 3000;
-const SIGNAL_COOLDOWN_MS = 2 * 60 * 1000;
 const MAX_QUOTE_ACTIVES  = 10;
-const MIN_PROB = 50; // prob mínima
+const MIN_PROB = 55;
+const MAX_PROB = 92;
 
-// ===== CORS =====
-const allowOriginEnv = process.env.ALLOW_ORIGIN || '';
-const allowed = allowOriginEnv.split(',').map(s => s.trim()).filter(Boolean);
+const COOLDOWN_BASE_MIN = Number(process.env.COOLDOWN_BASE_MIN || 2);
+const COOLDOWN_BASE_MAX = Number(process.env.COOLDOWN_BASE_MAX || 4);
+const COOLDOWN_EXTRA_MIN = Number(process.env.COOLDOWN_EXTRA_MIN || 5);
+const COOLDOWN_EXTRA_MAX = Number(process.env.COOLDOWN_EXTRA_MAX || 6);
+const COOLDOWN_EXTRA_CHANCE = Number(process.env.COOLDOWN_EXTRA_CHANCE || 0.3);
+
+function rngCooldownMs(){
+  const r = Math.random();
+  const mins = (r < (1 - COOLDOWN_EXTRA_CHANCE))
+    ? (COOLDOWN_BASE_MIN + Math.random()*(COOLDOWN_BASE_MAX-COOLDOWN_BASE_MIN))
+    : (COOLDOWN_EXTRA_MIN + Math.random()*(COOLDOWN_EXTRA_MAX-COOLDOWN_EXTRA_MIN));
+  return Math.round(mins * 60 * 1000);
+}
+
+const allowed = String(process.env.ALLOW_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
 app.use((req, res, next) => {
   const o = req.headers.origin;
   if (o && allowed.includes(o)) {
@@ -27,31 +38,26 @@ app.use((req, res, next) => {
   next();
 });
 
-// ===== Estado =====
 let SDKModule = null, sdk = null, connected = false, lastError = null;
 let demoMode = (process.env.DEMO_MODE || '').trim() === '1';
 let pairsCache = [];
 let allowedTickersSet = new Set();
-let demoTimer = null;
 
-// Lock de operação (até o fim da vela alvo)
 let tradeLock = { locked:false, active:null, activeId:null, openedAt:0, expiresAt:0, entryAt:0, validUntil:0, preOpenAt:0 };
+let globalNextAllowedAt = 0;
 
-// Preços e memórias
-const latestPrice = new Map();   // activeId -> last price
-const priceBuffers = new Map();  // activeId -> number[]
-const lastSignalAt = new Map();  // activeId -> timestamp
+const latestPrice = new Map();
+const priceBuffers = new Map();
 
-// ===== SSE =====
 const sseClients = new Set();
 const SSE_PING_MS = 15000;
 function sseSend(res, payload, eventName='message'){ res.write(`event: ${eventName}\n`); res.write(`data: ${JSON.stringify(payload)}\n\n`); }
+function sseHello(res){ res.write('retry: 4000\n\n'); }
 function broadcast(type, payload){ for (const r of sseClients){ try{ sseSend(r, payload, type); }catch{} } }
 function broadcastSignal(sig){ broadcast('signal', sig); }
 function broadcastResult(resu){ broadcast('result', resu); }
-setInterval(()=>{ for (const r of sseClients){ try{ sseSend(r, { t: Date.now() }, 'ping'); }catch{} } }, SSE_PING_MS);
+setInterval(()=>{ for (const r of sseClients){ try{ sseSend(r, { t: Date.now(), nextAllowedAt: globalNextAllowedAt }, 'ping'); }catch{} } }, SSE_PING_MS);
 
-// ===== Utils =====
 const log=(...a)=>console.log('[IaLife]',...a);
 const errlog=(...a)=>console.error('[IaLife][ERR]',...a);
 
@@ -62,10 +68,6 @@ function fmtHHMM(dateOrTs){
   return new Intl.DateTimeFormat('pt-BR', { hour:'2-digit', minute:'2-digit', hour12:false, timeZone: DISPLAY_TZ }).format(d);
 }
 
-// Janela alvo: vela da PRÓXIMA virada de minuto
-// - preOpenAt: 30s antes da vela iniciar
-// - entryAt:   início da vela
-// - validUntil: fim da mesma vela (entryAt + 60s)
 function computeOpWindow(nowDate){
   const now = nowDate instanceof Date ? nowDate : new Date();
   const entryAt = new Date(Math.ceil(now.getTime() / 60000) * 60000);
@@ -74,12 +76,39 @@ function computeOpWindow(nowDate){
   return { preOpenAt, entryAt, validUntil };
 }
 
-function sma(arr, len){ if (!arr || arr.length < len) return null; let s=0; for (let i=arr.length-len;i<arr.length;i++) s+=arr[i]; return s/len; }
-function pushPrice(activeId, price, maxLen=50){ const buf=priceBuffers.get(activeId)||[]; buf.push(price); if (buf.length>maxLen) buf.shift(); priceBuffers.set(activeId, buf); return buf; }
-function probFromDistance(p, avg){
-  const dist=Math.abs((p-avg)/avg);
-  let base=MIN_PROB + Math.min(50-(MIN_PROB-0), Math.round(dist*10000));
-  if (base>90) base=90; if (base<MIN_PROB) base=MIN_PROB; return base;
+function sma(arr, len){
+  if (!arr || arr.length < len) return null;
+  let s=0; for (let i=arr.length-len;i<arr.length;i++) s+=arr[i];
+  return s/len;
+}
+function stddev(arr, len){
+  if (!arr || arr.length < len) return null;
+  let m = sma(arr, len); if (m == null) return null;
+  let s2 = 0;
+  for (let i=arr.length-len;i<arr.length;i++){ const d=arr[i]-m; s2 += d*d; }
+  return Math.sqrt(s2/len);
+}
+function pushPrice(activeId, price, maxLen=180){
+  const buf=priceBuffers.get(activeId)||[]; buf.push(price); if (buf.length>maxLen) buf.shift();
+  priceBuffers.set(activeId, buf); return buf;
+}
+function clamp(x, a, b){ return Math.max(a, Math.min(b, x)); }
+function probFromBuffer(p, buf){
+  const avg = sma(buf, 20);
+  const st  = stddev(buf, 20);
+  if (!avg){
+    return clamp(Math.round(57 + Math.random()*25), MIN_PROB, MAX_PROB);
+  }
+  const dist = Math.abs(p-avg);
+  if (st && st>0){
+    const sigma = dist / st;
+    const scaled = 1 - Math.exp(-0.9 * Math.min(3, sigma));
+    let base = MIN_PROB + Math.round(scaled * (MAX_PROB - MIN_PROB));
+    base += (Math.random()*6 - 3);
+    return clamp(Math.round(base), MIN_PROB, MAX_PROB);
+  } else {
+    return clamp(Math.round(60 + Math.random()*25), MIN_PROB, MAX_PROB);
+  }
 }
 
 function maybeReleaseTradeLock(){
@@ -97,6 +126,14 @@ function acquireTradeLock(name, id, preOpenAt, entryAt, validUntil){
   log('Trade lock até (fim da vela):', validUntil.toISOString(), 'ativo:', name);
 }
 
+function applyCooldownFrom(validUntilMs){
+  const cd = rngCooldownMs();
+  const next = Math.max(globalNextAllowedAt, validUntilMs + cd);
+  globalNextAllowedAt = next;
+  log('Cooldown ON → próximo permitido após:', new Date(next).toISOString());
+  return next;
+}
+
 function scheduleResult(activeId, name, ordem, entryAtMs, validUntilMs, extra={}){
   const snap = ()=> latestPrice.get(activeId);
   const t1 = Math.max(0, entryAtMs - Date.now());
@@ -111,7 +148,7 @@ function scheduleResult(activeId, name, ordem, entryAtMs, validUntilMs, extra={}
     }
     setTimeout(()=>{
       const closePrice = snap();
-      const cp = (closePrice == null) ? entryPrice : closePrice; // fallback
+      const cp = (closePrice == null) ? entryPrice : closePrice;
       let win = null;
       if (entryPrice != null && cp != null){
         win = (ordem === 'COMPRA') ? (cp > entryPrice) : (cp < entryPrice);
@@ -121,11 +158,11 @@ function scheduleResult(activeId, name, ordem, entryAtMs, validUntilMs, extra={}
         entryAt: entryAtMs, validUntil: validUntilMs,
         entryPrice, closePrice: cp, win, ...extra
       });
+      applyCooldownFrom(validUntilMs);
     }, t2 - t1);
   }, t1);
 }
 
-// ===== SDK =====
 async function loadSdkIfPossible(){
   if (SDKModule || demoMode) return !!SDKModule;
   try { SDKModule = await import('@quadcode-tech/client-sdk-js'); log('Quadcode SDK importado.'); return true; }
@@ -173,13 +210,11 @@ async function wireQuoteSignals(currentSdk){
       latestPrice.set(activeId, price);
 
       if (tradeLock.locked) return;
+      if (Date.now() < globalNextAllowedAt) return;
 
       const buf = pushPrice(activeId, price);
       const avg = sma(buf, 20);
       if (!avg) return;
-
-      const lastAt = lastSignalAt.get(activeId) || 0;
-      if (Date.now() - lastAt < SIGNAL_COOLDOWN_MS) return;
 
       const prev = buf[buf.length - 2];
       if (typeof prev !== 'number') return;
@@ -188,25 +223,21 @@ async function wireQuoteSignals(currentSdk){
       const crossedDown = prev > avg && price < avg;
       if (!crossedUp && !crossedDown) return;
 
-      lastSignalAt.set(activeId, Date.now());
-      if (!allowedTickersSet.has(name)) return;
-
-      const refNow = currentSdk.currentTime ? currentSdk.currentTime() : new Date();
-      const { preOpenAt, entryAt, validUntil } = computeOpWindow(refNow);
-
-      acquireTradeLock(name, activeId, preOpenAt, entryAt, validUntil);
-
-      // Ordem "bruta" pela direção do cruzamento
       const ordemRaw = crossedUp ? 'COMPRA' : 'VENDA';
-      // Inverte para alinhar com comportamento observado (VENDA -> COMPRA; COMPRA -> VENDA)
       const ordem = (ordemRaw === 'COMPRA') ? 'VENDA' : 'COMPRA';
 
-      const prob  = probFromDistance(price, avg);
+      const { preOpenAt, entryAt, validUntil } = computeOpWindow(currentSdk.currentTime ? currentSdk.currentTime() : new Date());
+      acquireTradeLock(name, activeId, preOpenAt, entryAt, validUntil);
+
+      const prob  = probFromBuffer(price, buf);
       const horario = fmtHHMM(entryAt);
+
+      const nextAllowed = applyCooldownFrom(validUntil.getTime());
 
       const payload = {
         ativo:name, timeframe:'M1', ordem, horario, prob,
         preOpenAt: preOpenAt.getTime(), entryAt: entryAt.getTime(), validUntil: validUntil.getTime(),
+        nextAllowedAt: nextAllowed,
         window: { pre: 30000, entry: 30000, close: 30000 }
       };
       broadcastSignal(payload);
@@ -241,7 +272,7 @@ async function connectReal(){
     connected = true; lastError = null; log('Conectado (real).');
 
     allowedTickersSet = await loadBinaryDigitalTickers(sdk);
-    log('Tickers permitidos:', allowedTickersSet.size);
+    log('Tickers permitidos (Bin/Digi):', allowedTickersSet.size);
     if (allowedTickersSet.size === 0){ pairsCache = []; return { ok:true, note:'no_binary_digital_open' }; }
 
     await wireQuoteSignals(sdk);
@@ -251,42 +282,47 @@ async function connectReal(){
   }
 }
 
+// Demo
+let demoInterval = null;
 function startDemoTicker(){
-  stopDemoTimer();
-  demoTimer = setInterval(()=>{
+  stopDemoTicker();
+  demoInterval = setInterval(()=>{
     if (!connected) return;
-    maybeReleaseTradeLock();
-    if (tradeLock.locked) return;
+    if (Date.now() < globalNextAllowedAt) return;
 
     const base = pairsCache.length ? pairsCache : ['EUR/USD','GBP/USD','USD/JPY'];
     const ativo = base[Math.floor(Math.random()*base.length)];
     const now = new Date();
     const { preOpenAt, entryAt, validUntil } = computeOpWindow(now);
+
     acquireTradeLock(ativo, null, preOpenAt, entryAt, validUntil);
 
-    // Inverte a ordem também no modo demo
     const ordemRaw = Math.random()>0.5?'COMPRA':'VENDA';
     const ordem = (ordemRaw === 'COMPRA') ? 'VENDA' : 'COMPRA';
 
-    const prob = Math.max(MIN_PROB, 58 + Math.floor(Math.random()*29));
+    const prob = Math.max(MIN_PROB, Math.min(MAX_PROB, Math.round(57 + Math.random()*28)));
     const horario = fmtHHMM(entryAt);
+
+    const nextAllowed = applyCooldownFrom(validUntil.getTime());
+
     const payload = {
       ativo, timeframe:'M1', ordem, horario, prob,
       preOpenAt: preOpenAt.getTime(), entryAt: entryAt.getTime(), validUntil: validUntil.getTime(),
+      nextAllowedAt: nextAllowed,
       window: { pre: 30000, entry: 30000, close: 30000 }
     };
     broadcastSignal(payload);
 
     setTimeout(()=>{
-      // Chance baseada na probabilidade
       const winChance = Math.min(0.9, Math.max(MIN_PROB/100, prob/100));
       const win = Math.random() < winChance;
       broadcastResult({ ativo, timeframe:'M1', ordem, entryAt: payload.entryAt, validUntil: payload.validUntil, entryPrice: 1, closePrice: win?1.001:0.999, win, prob });
+      applyCooldownFrom(payload.validUntil);
     }, Math.max(0, payload.validUntil - Date.now()));
   }, 20000);
   log('Demo ticker iniciado.');
 }
-function stopDemoTimer(){ if (demoTimer){ clearInterval(demoTimer); demoTimer=null; log('Demo ticker parado.'); } }
+function stopDemoTicker(){ if (demoInterval){ clearInterval(demoInterval); demoInterval=null; log('Demo ticker parado.'); } }
 
 async function connectDemo(){
   connected = true; lastError = null;
@@ -296,41 +332,34 @@ async function connectDemo(){
   return { ok:true, demo:true };
 }
 
-// ===== Rotas =====
-app.get('/status', (req,res)=>{
-  res.json({ ok:true, connected, lastError, lock: tradeLock, pairs: pairsCache, env: envView() });
-});
-
+app.get('/status', (req,res)=>{ res.json({ ok:true, connected, lastError, lock: tradeLock, pairs: pairsCache, env: envView(), nextAllowedAt: globalNextAllowedAt }); });
 app.post('/connect', async (req,res)=>{
-  if (connected) return res.json({ ok:true, already:true, demo: demoMode, lock: tradeLock });
+  if (connected) return res.json({ ok:true, already:true, demo: demoMode, lock: tradeLock, nextAllowedAt: globalNextAllowedAt });
   const result = demoMode ? await connectDemo() : await connectReal();
-  if (!result.ok) { const fb = await connectDemo(); return res.json({ ...fb, fallbackFrom: result.error || 'unknown' }); }
-  return res.json({ ...result, lock: tradeLock });
+  if (!result.ok) { const fb = await connectDemo(); return res.json({ ...fb, fallbackFrom: result.error || 'unknown', nextAllowedAt: globalNextAllowedAt }); }
+  return res.json({ ...result, lock: tradeLock, nextAllowedAt: globalNextAllowedAt });
 });
-
 app.post('/disconnect', (req,res)=>{
   connected=false; lastError=null;
   if (sdk?.disconnect) try{ sdk.disconnect(); }catch{}
-  sdk=null; stopDemoTimer();
+  sdk=null; stopDemoTicker();
   tradeLock = { locked:false, active:null, activeId:null, openedAt:0, expiresAt:0, entryAt:0, validUntil:0, preOpenAt:0 };
   res.json({ ok:true });
 });
-
 app.get('/open-pairs', async (req,res)=>{
   if (!connected) return res.status(400).json({ ok:false, error:'not_connected' });
   return res.json({ ok:true, pairs: pairsCache });
 });
-
 app.get('/events', (req,res)=>{
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  sseHello(res);
   sseClients.add(res);
   log('SSE client +1 total:', sseClients.size);
-  sseSend(res, { t: Date.now(), connected }, 'ping');
+  sseSend(res, { t: Date.now(), connected, nextAllowedAt: globalNextAllowedAt }, 'ping');
   req.on('close', ()=>{ sseClients.delete(res); log('SSE client -1 total:', sseClients.size); try{ res.end(); }catch{} });
 });
-
-app.get('/', (req,res)=> res.json({ ok:true, service:'IaLife Backend', connected, lastError }) );
+app.get('/', (req,res)=> res.json({ ok:true, service:'IaLife Backend', connected, lastError, nextAllowedAt: globalNextAllowedAt }) );
 
 app.listen(PORT, ()=>{ log(`Servidor ouvindo :${PORT}`, envView()); });
