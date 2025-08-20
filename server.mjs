@@ -1,4 +1,4 @@
-// server.mjs — IaLife Backend (SMA-20 + resultados + lock 2xM1 + filtro Bin/Digi + TZ + SSE)
+// server.mjs — IaLife Backend (janela: -30s/+60s da vela alvo, resultado na mesma vela)
 import express from 'express';
 import cors from 'cors';
 
@@ -10,7 +10,7 @@ const DISPLAY_TZ = process.env.DISPLAY_TZ || 'America/Sao_Paulo';
 const PORT = process.env.PORT || 3000;
 const SIGNAL_COOLDOWN_MS = 2 * 60 * 1000;
 const MAX_QUOTE_ACTIVES  = 10;
-const MIN_PROB = 50; // <-- mínimo 50%
+const MIN_PROB = 50; // prob mínima
 
 // ===== CORS =====
 const allowOriginEnv = process.env.ALLOW_ORIGIN || '';
@@ -34,10 +34,10 @@ let pairsCache = [];
 let allowedTickersSet = new Set();
 let demoTimer = null;
 
-// Lock de operação (2 velas M1)
-let tradeLock = { locked:false, active:null, activeId:null, openedAt:0, expiresAt:0, entryAt:0, validUntil:0 };
+// Lock de operação (até o fim da vela alvo)
+let tradeLock = { locked:false, active:null, activeId:null, openedAt:0, expiresAt:0, entryAt:0, validUntil:0, preOpenAt:0 };
 
-// Preços recentes e snapshots p/ resultado
+// Preços e memórias
 const latestPrice = new Map();   // activeId -> last price
 const priceBuffers = new Map();  // activeId -> number[]
 const lastSignalAt = new Map();  // activeId -> timestamp
@@ -54,7 +54,6 @@ setInterval(()=>{ for (const r of sseClients){ try{ sseSend(r, { t: Date.now() }
 // ===== Utils =====
 const log=(...a)=>console.log('[IaLife]',...a);
 const errlog=(...a)=>console.error('[IaLife][ERR]',...a);
-const pad2=(n)=>String(n).padStart(2,'0');
 
 function envView(){ return { DISPLAY_TZ, WS_URL:process.env.WS_URL, HTTP_HOST:process.env.HTTP_HOST, PLATFORM_ID:process.env.PLATFORM_ID, DEMO_MODE: demoMode?'1':'0' }; }
 
@@ -63,69 +62,64 @@ function fmtHHMM(dateOrTs){
   return new Intl.DateTimeFormat('pt-BR', { hour:'2-digit', minute:'2-digit', hour12:false, timeZone: DISPLAY_TZ }).format(d);
 }
 
-function computeCandleWindow(nowDate){
+// Janela alvo: vela da PRÓXIMA virada de minuto
+// - preOpenAt: 30s antes da vela iniciar
+// - entryAt:   início da vela
+// - validUntil: fim da mesma vela (entryAt + 60s)
+function computeOpWindow(nowDate){
   const now = nowDate instanceof Date ? nowDate : new Date();
   const entryAt = new Date(Math.ceil(now.getTime() / 60000) * 60000);
-  const validUntil = new Date(entryAt.getTime() + 2 * 60000);
-  return { entryAt, validUntil };
+  const preOpenAt = new Date(entryAt.getTime() - 30000);
+  const validUntil = new Date(entryAt.getTime() + 60000);
+  return { preOpenAt, entryAt, validUntil };
 }
 
 function sma(arr, len){ if (!arr || arr.length < len) return null; let s=0; for (let i=arr.length-len;i<arr.length;i++) s+=arr[i]; return s/len; }
 function pushPrice(activeId, price, maxLen=50){ const buf=priceBuffers.get(activeId)||[]; buf.push(price); if (buf.length>maxLen) buf.shift(); priceBuffers.set(activeId, buf); return buf; }
-
 function probFromDistance(p, avg){
   const dist=Math.abs((p-avg)/avg);
-  let base=MIN_PROB + Math.min(50-(MIN_PROB-0), Math.round(dist*10000)); // mapeia dist pequeno para +poucos pontos
-  if (base>90) base=90;
-  if (base<MIN_PROB) base=MIN_PROB;
-  return base;
+  let base=MIN_PROB + Math.min(50-(MIN_PROB-0), Math.round(dist*10000));
+  if (base>90) base=90; if (base<MIN_PROB) base=MIN_PROB; return base;
 }
 
 function maybeReleaseTradeLock(){
   if (tradeLock.locked && Date.now() >= tradeLock.validUntil){
-    tradeLock = { locked:false, active:null, activeId:null, openedAt:0, expiresAt:0, entryAt:0, validUntil:0 };
-    log('Trade lock liberado.');
+    tradeLock = { locked:false, active:null, activeId:null, openedAt:0, expiresAt:0, entryAt:0, validUntil:0, preOpenAt:0 };
+    log('Trade lock liberado no fim da vela.');
   }
 }
-function acquireTradeLock(name, id, entryAt, validUntil){
-  tradeLock = { locked:true, active:name, activeId:id, openedAt:Date.now(), expiresAt: validUntil.getTime(), entryAt: entryAt.getTime(), validUntil: validUntil.getTime() };
-  log('Trade lock até', validUntil.toISOString(), 'para', name);
+function acquireTradeLock(name, id, preOpenAt, entryAt, validUntil){
+  tradeLock = {
+    locked:true, active:name, activeId:id,
+    openedAt:Date.now(), expiresAt: validUntil.getTime(),
+    preOpenAt: preOpenAt.getTime(), entryAt: entryAt.getTime(), validUntil: validUntil.getTime()
+  };
+  log('Trade lock até (fim da vela):', validUntil.toISOString(), 'ativo:', name);
 }
 
-// Agenda o resultado (snapshot no entry e no close)
 function scheduleResult(activeId, name, ordem, entryAtMs, validUntilMs, extra={}){
-  const snapEntry = ()=> latestPrice.get(activeId);
-  const snapClose = ()=> latestPrice.get(activeId);
-
+  const snap = ()=> latestPrice.get(activeId);
   const t1 = Math.max(0, entryAtMs - Date.now());
   const t2 = Math.max(0, validUntilMs - Date.now());
 
   let entryPrice = null;
-
   setTimeout(()=>{
-    entryPrice = snapEntry();
-    // caso ainda nulo, tenta pegar do buffer
+    entryPrice = snap();
     if (entryPrice == null){
       const buf = priceBuffers.get(activeId) || [];
       entryPrice = buf.length ? buf[buf.length-1] : null;
     }
     setTimeout(()=>{
-      const closePrice = snapClose();
+      const closePrice = snap();
       const cp = (closePrice == null) ? entryPrice : closePrice; // fallback
       let win = null;
       if (entryPrice != null && cp != null){
         win = (ordem === 'COMPRA') ? (cp > entryPrice) : (cp < entryPrice);
       }
       broadcastResult({
-        ativo: name,
-        timeframe: 'M1',
-        ordem,
-        entryAt: entryAtMs,
-        validUntil: validUntilMs,
-        entryPrice,
-        closePrice: cp,
-        win,
-        ...extra
+        ativo: name, timeframe: 'M1', ordem,
+        entryAt: entryAtMs, validUntil: validUntilMs,
+        entryPrice, closePrice: cp, win, ...extra
       });
     }, t2 - t1);
   }, t1);
@@ -159,7 +153,6 @@ async function loadBinaryDigitalTickers(currentSdk){
 }
 
 async function wireQuoteSignals(currentSdk){
-  const { ClientSdk } = SDKModule;
   const quotes = await currentSdk.quotes();
   const bo = await currentSdk.blitzOptions();
   const now = currentSdk.currentTime ? currentSdk.currentTime() : new Date();
@@ -199,18 +192,20 @@ async function wireQuoteSignals(currentSdk){
       if (!allowedTickersSet.has(name)) return;
 
       const refNow = currentSdk.currentTime ? currentSdk.currentTime() : new Date();
-      const { entryAt, validUntil } = computeCandleWindow(refNow);
+      const { preOpenAt, entryAt, validUntil } = computeOpWindow(refNow);
 
-      acquireTradeLock(name, activeId, entryAt, validUntil);
+      acquireTradeLock(name, activeId, preOpenAt, entryAt, validUntil);
 
       const ordem = crossedUp ? 'COMPRA' : 'VENDA';
       const prob  = probFromDistance(price, avg);
       const horario = fmtHHMM(entryAt);
 
-      const payload = { ativo:name, timeframe:'M1', ordem, horario, prob, entryAt: entryAt.getTime(), validUntil: validUntil.getTime(), candles:2 };
+      const payload = {
+        ativo:name, timeframe:'M1', ordem, horario, prob,
+        preOpenAt: preOpenAt.getTime(), entryAt: entryAt.getTime(), validUntil: validUntil.getTime(),
+        window: { pre: 30000, entry: 30000, close: 30000 }
+      };
       broadcastSignal(payload);
-
-      // agenda resultado para esse sinal
       scheduleResult(activeId, name, ordem, payload.entryAt, payload.validUntil, { prob });
     });
   }
@@ -262,16 +257,19 @@ function startDemoTicker(){
     const base = pairsCache.length ? pairsCache : ['EUR/USD','GBP/USD','USD/JPY'];
     const ativo = base[Math.floor(Math.random()*base.length)];
     const now = new Date();
-    const { entryAt, validUntil } = computeCandleWindow(now);
-    acquireTradeLock(ativo, null, entryAt, validUntil);
+    const { preOpenAt, entryAt, validUntil } = computeOpWindow(now);
+    acquireTradeLock(ativo, null, preOpenAt, entryAt, validUntil);
 
     const ordem = Math.random()>0.5?'COMPRA':'VENDA';
     const prob = Math.max(MIN_PROB, 58 + Math.floor(Math.random()*29));
     const horario = fmtHHMM(entryAt);
-    const payload = { ativo, timeframe:'M1', ordem, horario, prob, entryAt: entryAt.getTime(), validUntil: validUntil.getTime(), candles:2 };
+    const payload = {
+      ativo, timeframe:'M1', ordem, horario, prob,
+      preOpenAt: preOpenAt.getTime(), entryAt: entryAt.getTime(), validUntil: validUntil.getTime(),
+      window: { pre: 30000, entry: 30000, close: 30000 }
+    };
     broadcastSignal(payload);
 
-    // resultado demo: sorteia com viés pela prob (não exato, só pra UI)
     setTimeout(()=>{
       const winChance = Math.min(0.9, Math.max(MIN_PROB/100, prob/100));
       const win = Math.random() < winChance;
@@ -306,7 +304,7 @@ app.post('/disconnect', (req,res)=>{
   connected=false; lastError=null;
   if (sdk?.disconnect) try{ sdk.disconnect(); }catch{}
   sdk=null; stopDemoTimer();
-  tradeLock = { locked:false, active:null, activeId:null, openedAt:0, expiresAt:0, entryAt:0, validUntil:0 };
+  tradeLock = { locked:false, active:null, activeId:null, openedAt:0, expiresAt:0, entryAt:0, validUntil:0, preOpenAt:0 };
   res.json({ ok:true });
 });
 
