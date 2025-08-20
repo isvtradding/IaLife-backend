@@ -1,176 +1,222 @@
-// server.mjs — IaLife backend (Express + Quadcode SDK) com DEBUG
-
+// server.mjs — IaLife Backend (Express + SSE)
 import express from 'express';
-import dotenv from 'dotenv';
-import { ClientSdk, LoginPasswordAuthMethod, SsidAuthMethod } from '@quadcode-tech/client-sdk-js';
+import cors from 'cors';
 
-dotenv.config();
 const app = express();
-
-/* ---------- CORS ---------- */
-const allowed = (process.env.ALLOW_ORIGIN || '')
-  .split(',')
-  .map(s => s.trim())
-  .filter(Boolean);
-
-app.use((req, res, next) => {
-  const origin = req.headers.origin;
-  if (allowed.includes('*')) {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-    if (req.method === 'OPTIONS') return res.sendStatus(204);
-    return next();
-  }
-  if (origin && allowed.includes(origin)) {
-    res.header('Access-Control-Allow-Origin', origin);
-    res.header('Vary', 'Origin');
-    res.header('Access-Control-Allow-Credentials', 'true');
-    res.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-    res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-    if (req.method === 'OPTIONS') return res.sendStatus(204);
-  }
-  return next();
-});
-/* -------------------------- */
-
 app.use(express.json());
 
-/* ---------- ENV / Config ---------- */
-const WS_URL = process.env.WS_URL || 'wss://ws.trade.atriunbroker.finance/echo/websocket';
-const PLATFORM_ID = Number(process.env.PLATFORM_ID || 499);
-const HTTP_HOST = process.env.HTTP_HOST || 'https://trade.atriunbroker.finance';
+const allowOriginEnv = process.env.ALLOW_ORIGIN || '';
+const allowed = allowOriginEnv.split(',').map(s => s.trim()).filter(Boolean);
+app.use((req, res, next) => {
+  const o = req.headers.origin;
+  if (o && allowed.includes(o)) {
+    res.header('Access-Control-Allow-Origin', o);
+    res.header('Vary', 'Origin');
+  }
+  res.header('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type,Authorization');
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
 
-let sdk = null;
-let lastConnectError = null;
+const PORT = process.env.PORT || 3000;
 
-const mustHave = (...keys) => keys.filter(k => !process.env[k] || String(process.env[k]).trim()==='');
+let SDK = null;
+let client = null;
+let connected = false;
+let lastError = null;
+let demoMode = (process.env.DEMO_MODE || '').trim() === '1';
+let pairsCache = [];
+let demoTimer = null;
 
-function mkError(e) {
+const sseClients = new Set();
+const SSE_PING_MS = 15000;
+
+function sseSend(res, payload, eventName='message') {
+  res.write(`event: ${eventName}\n`);
+  res.write(`data: ${JSON.stringify(payload)}\n\n`);
+}
+function broadcastSignal(signal) {
+  for (const res of sseClients) {
+    try { sseSend(res, signal, 'signal'); } catch {}
+  }
+}
+setInterval(() => {
+  for (const res of sseClients) {
+    try { sseSend(res, { t: Date.now() }, 'ping'); } catch {}
+  }
+}, SSE_PING_MS);
+
+function log(...a){ console.log('[IaLife]', ...a); }
+function errlog(...a){ console.error('[IaLife][ERR]', ...a); }
+function getEnv() {
   return {
-    ok: false,
-    error: e?.message || String(e) || 'connect_failed',
-    type: e?.constructor?.name || null,
-    code: e?.code || null,
-    httpStatus: e?.response?.status || null,
-    httpStatusText: e?.response?.statusText || null,
+    WS_URL: process.env.WS_URL,
+    HTTP_HOST: process.env.HTTP_HOST,
+    PLATFORM_ID: process.env.PLATFORM_ID,
+    ATRIUN_LOGIN: process.env.ATRIUN_LOGIN ? '(set)' : '(unset)',
+    ATRIUN_PASSWORD: process.env.ATRIUN_PASSWORD ? '(set)' : '(unset)',
+    ALLOW_ORIGIN: allowOriginEnv,
+    DEMO_MODE: demoMode ? '1' : '0',
   };
 }
 
-/* ---------- SDK Connect helpers ---------- */
-async function connectWithLogin(login, password) {
-  console.log('[IaLife] connectWithLogin → start', { HTTP_HOST, PLATFORM_ID, WS_URL, login: !!login });
-  lastConnectError = null;
-
-  // Passo 1: criar SDK
-  const client = await ClientSdk.create(
-    WS_URL,
-    PLATFORM_ID,
-    new LoginPasswordAuthMethod(HTTP_HOST, login, password),
-    { host: HTTP_HOST }
-  );
-
-  console.log('[IaLife] connectWithLogin → SDK criado');
-
-  // Passo 2: fazer uma chamada simples para validar sessão
+async function loadSdkIfPossible() {
+  if (SDK || demoMode) return !!SDK;
   try {
-    await client.profile?.getProfile?.(); // se existir
-    console.log('[IaLife] connectWithLogin → profile OK');
+    SDK = await import('@quadcode-tech/client-sdk-js');
+    log('SDK importado com sucesso.');
+    return true;
   } catch (e) {
-    console.warn('[IaLife] profile check falhou (não é crítico):', e?.message || e);
+    errlog('Falha ao importar SDK, ativando DEMO_MODE:', e?.message || e);
+    demoMode = true;
+    lastError = 'sdk_import_failed';
+    return false;
+  }
+}
+
+async function connectReal() {
+  await loadSdkIfPossible();
+  if (!SDK) return { ok:false, error:'sdk_unavailable' };
+
+  const WS_URL = process.env.WS_URL;
+  const HTTP_HOST = process.env.HTTP_HOST;
+  const PLATFORM_ID = Number(process.env.PLATFORM_ID || '0');
+  const LOGIN = process.env.ATRIUN_LOGIN;
+  const PASSWORD = process.env.ATRIUN_PASSWORD;
+
+  if (!WS_URL || !HTTP_HOST || !PLATFORM_ID || !LOGIN || !PASSWORD) {
+    const miss = [];
+    if (!WS_URL) miss.push('WS_URL');
+    if (!HTTP_HOST) miss.push('HTTP_HOST');
+    if (!PLATFORM_ID) miss.push('PLATFORM_ID');
+    if (!LOGIN) miss.push('ATRIUN_LOGIN');
+    if (!PASSWORD) miss.push('ATRIUN_PASSWORD');
+    lastError = 'missing_env:' + miss.join(',');
+    return { ok:false, error:lastError };
   }
 
-  sdk = client;
-  return true;
+  try {
+    const { LoginPasswordAuthMethod, createClient } = SDK;
+    const auth = new LoginPasswordAuthMethod(HTTP_HOST, LOGIN, PASSWORD);
+    client = await createClient({ platformId: PLATFORM_ID, wsUrl: WS_URL, authMethod: auth });
+
+    connected = true;
+    lastError = null;
+    log('Conectado na Atriun (real).');
+
+    try {
+      if (client?.instruments?.getInstruments) {
+        const list = await client.instruments.getInstruments();
+        pairsCache = Array.isArray(list) ? list.map(x => (x?.displayName || x?.symbol || x?.name)).filter(Boolean) : [];
+        log('Pares carregados:', pairsCache.length);
+      }
+    } catch (e) { errlog('Falha ao carregar pares:', e?.message || e); }
+
+    // Exemplo de assinatura de sinais (ajuste conforme SDK real):
+    // if (client.signals?.on) {
+    //   client.signals.on('signal', (sig) => {
+    //     const normalized = {
+    //       ativo: sig?.symbol || sig?.asset || 'DESCONHECIDO',
+    //       timeframe: sig?.timeframe || 'M1',
+    //       ordem: (sig?.direction || 'COMPRA').toUpperCase(),
+    //       horario: new Date().toLocaleTimeString('pt-BR', {hour:'2-digit', minute:'2-digit'}),
+    //       prob: Math.max(40, Math.min(100, Math.round(sig?.probability ?? 60)))
+    //     };
+    //     broadcastSignal(normalized);
+    //   });
+    // }
+
+    return { ok:true };
+  } catch (e) {
+    connected = false;
+    lastError = 'connect_failed:' + (e?.message || String(e));
+    errlog('Erro ao conectar (real):', e);
+    return { ok:false, error:lastError };
+  }
 }
 
-async function connectWithSSID(ssid) {
-  console.log('[IaLife] connectWithSSID → start', { HTTP_HOST, PLATFORM_ID, WS_URL, ssid: !!ssid });
-  lastConnectError = null;
+function startDemoTicker() {
+  stopDemoTicker();
+  demoTimer = setInterval(() => {
+    if (!connected) return;
+    const ativos = pairsCache.length ? pairsCache : ['EUR/USD','GBP/USD','USD/JPY','EUR/JPY','AUD/USD','NZD/USD'];
+    const ativo = ativos[Math.floor(Math.random()*ativos.length)];
+    const now = new Date();
+    const h = String(now.getHours()).padStart(2, '0');
+    const m = String(now.getMinutes()).padStart(2, '0');
+    const prob = 58 + Math.floor(Math.random()*29);
+    broadcastSignal({ ativo, timeframe:'M1', ordem: Math.random()>0.5?'COMPRA':'VENDA', horario:`${h}:${m}`, prob });
+  }, 20000);
+  log('Demo ticker iniciado.');
+}
+function stopDemoTicker() { if (demoTimer) { clearInterval(demoTimer); demoTimer = null; log('Demo ticker parado.'); } }
 
-  const client = await ClientSdk.create(
-    WS_URL,
-    PLATFORM_ID,
-    new SsidAuthMethod(ssid),
-    { host: HTTP_HOST }
-  );
-
-  console.log('[IaLife] connectWithSSID → SDK criado');
-  sdk = client;
-  return true;
+async function connectDemo() {
+  connected = true;
+  lastError = null;
+  if (pairsCache.length === 0) pairsCache = ['EUR/USD','GBP/USD','USD/JPY','EUR/JPY','AUD/USD','NZD/USD'];
+  startDemoTicker();
+  return { ok:true, demo:true };
 }
 
-/* ---------- Rotas ---------- */
-app.get('/', (_req, res) => res.json({ ok: true, message: 'IaLife backend up' }));
+// Routes
+app.get('/status', (req, res) => { res.json({ ok:true, connected, lastError, env:{
+  WS_URL: process.env.WS_URL,
+  HTTP_HOST: process.env.HTTP_HOST,
+  PLATFORM_ID: process.env.PLATFORM_ID,
+  ALLOW_ORIGIN: allowOriginEnv,
+  DEMO_MODE: demoMode ? '1' : '0',
+}}); });
 
-app.get('/debug/env', (_req, res) => {
-  res.json({
-    ok: true,
-    WS_URL, PLATFORM_ID, HTTP_HOST,
-    ALLOW_ORIGIN: process.env.ALLOW_ORIGIN || null,
-    ATRIUN_LOGIN: process.env.ATRIUN_LOGIN ? '(set)' : '(missing)',
-    ATRIUN_PASSWORD: process.env.ATRIUN_PASSWORD ? '(set)' : '(missing)'
+app.post('/connect', async (req, res) => {
+  if (connected) return res.json({ ok:true, already:true, demo: demoMode });
+  const result = demoMode ? await connectDemo() : await connectReal();
+  if (!result.ok && result.error?.startsWith('sdk_')) {
+    demoMode = true;
+    const fallback = await connectDemo();
+    return res.json({ ...fallback, fallbackFrom: result.error });
+  }
+  return res.status(result.ok ? 200 : 500).json(result);
+});
+
+app.post('/disconnect', (req, res) => {
+  connected = false;
+  lastError = null;
+  if (client?.disconnect) try { client.disconnect(); } catch {}
+  client = null;
+  stopDemoTicker();
+  res.json({ ok:true });
+});
+
+app.get('/open-pairs', async (req, res) => {
+  if (!connected) return res.status(400).json({ ok:false, error:'not_connected' });
+  if (!demoMode && client?.instruments?.getInstruments) {
+    try {
+      const list = await client.instruments.getInstruments();
+      pairsCache = Array.isArray(list) ? list.map(x => (x?.displayName || x?.symbol || x?.name)).filter(Boolean) : [];
+      return res.json({ ok:true, pairs: pairsCache });
+    } catch (e) {
+      lastError = 'pairs_failed:' + (e?.message || e);
+      return res.status(500).json({ ok:false, error:lastError });
+    }
+  }
+  return res.json({ ok:true, pairs: pairsCache });
+});
+
+app.get('/events', (req, res) => {
+  res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  sseClients.add(res);
+  log('SSE client conectado. Total:', sseClients.size);
+  sseSend(res, { t: Date.now(), connected }, 'ping');
+  req.on('close', () => {
+    sseClients.delete(res);
+    log('SSE client desconectado. Total:', sseClients.size);
+    try { res.end(); } catch {}
   });
 });
 
-app.get('/status', (_req, res) =>
-  res.json({ ok: true, connected: Boolean(sdk), lastError: lastConnectError ? String(lastConnectError) : null })
-);
-
-app.post('/connect', async (req, res) => {
-  try {
-    const miss = mustHave('HTTP_HOST', 'WS_URL', 'PLATFORM_ID');
-    if (miss.length) return res.status(500).json({ ok:false, error:'missing_env', details:miss });
-
-    const { login, password, ssid } = req.body || {};
-    if (ssid) {
-      await connectWithSSID(ssid);
-    } else {
-      const user = login || process.env.ATRIUN_LOGIN;
-      const pass = password || process.env.ATRIUN_PASSWORD;
-      if (!user || !pass) return res.status(400).json({ ok:false, error:'missing_credentials' });
-      await connectWithLogin(user, pass);
-    }
-    return res.json({ ok:true });
-  } catch (e) {
-    lastConnectError = e?.message || e;
-    console.error('[IaLife] connect error:', e);
-    return res.status(500).json(mkError(e));
-  }
-});
-
-app.get('/open-pairs', async (_req, res) => {
-  if (!sdk) return res.status(400).json({ ok:false, error:'not_connected' });
-  try {
-    const result = new Set();
-    const now = sdk.currentTime ? sdk.currentTime() : Date.now();
-
-    try {
-      const digital = await sdk.digitalOptions();
-      const under = digital.getUnderlyingsAvailableForTradingAt(now);
-      under.forEach(u => result.add(u.ticker || u.symbol || `ID:${u.activeId}`));
-    } catch (e) { console.warn('[IaLife] digitalOptions skip:', e?.message || e); }
-
-    try {
-      const blitz = await sdk.blitzOptions();
-      blitz.getActives().forEach(a => {
-        try { if (a.canBeBoughtAt(now)) result.add(a.ticker || a.name || `ID:${a.id}`); } catch {}
-      });
-    } catch (e) { console.warn('[IaLife] blitzOptions skip:', e?.message || e); }
-
-    try {
-      const binary = await sdk.binaryOptions();
-      binary.getActives().forEach(a => {
-        try { if (a.canBeBoughtAt(now)) result.add(a.ticker || a.name || `ID:${a.id}`); } catch {}
-      });
-    } catch (e) { console.warn('[IaLife] binaryOptions skip:', e?.message || e); }
-
-    res.json({ ok:true, pairs:[...result].sort() });
-  } catch (e) {
-    console.error('[IaLife] /open-pairs error:', e);
-    res.status(500).json({ ok:false, error: e?.message || 'open_pairs_failed' });
-  }
-});
-
-const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => console.log('IaLife backend running on port', PORT));
+app.get('/', (req, res) => { res.json({ ok:true, service:'IaLife Backend', connected, lastError }); });
+app.listen(PORT, () => { log(`Servidor ouvindo em :${PORT}`, getEnv()); });
