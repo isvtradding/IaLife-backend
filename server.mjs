@@ -1,4 +1,4 @@
-// server.mjs — IaLife Backend v2.0
+// server.mjs — IaLife Backend v2.1.1 (CORS permissivo)
 import express from 'express';
 import cors from 'cors';
 
@@ -16,6 +16,7 @@ const COOLDOWN_BASE_MAX = Number(process.env.COOLDOWN_BASE_MAX || 4);
 const COOLDOWN_EXTRA_MIN = Number(process.env.COOLDOWN_EXTRA_MIN || 5);
 const COOLDOWN_EXTRA_MAX = Number(process.env.COOLDOWN_EXTRA_MAX || 6);
 const COOLDOWN_EXTRA_CHANCE = Number(process.env.COOLDOWN_EXTRA_CHANCE || 0.3);
+const MIN_GAP_MS = Number(process.env.MIN_GAP_MS || 2*60*1000);
 
 function rngCooldownMs(){
   const r = Math.random();
@@ -25,10 +26,16 @@ function rngCooldownMs(){
   return Math.round(mins * 60 * 1000);
 }
 
-const allowed = String(process.env.ALLOW_ORIGIN || '').split(',').map(s => s.trim()).filter(Boolean);
+// ===== CORS (com fallback '*' ) =====
+const allowedRaw = String(process.env.ALLOW_ORIGIN || '*')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const allowAll = allowedRaw.includes('*') || allowedRaw.length === 0;
+
 app.use((req, res, next) => {
   const o = req.headers.origin;
-  if (o && allowed.includes(o)) {
+  if (allowAll){
+    res.header('Access-Control-Allow-Origin', '*');
+  } else if (o && allowedRaw.includes(o)) {
     res.header('Access-Control-Allow-Origin', o);
     res.header('Vary', 'Origin');
   }
@@ -45,23 +52,32 @@ let allowedTickersSet = new Set();
 
 let tradeLock = { locked:false, active:null, activeId:null, openedAt:0, expiresAt:0, entryAt:0, validUntil:0, preOpenAt:0 };
 let globalNextAllowedAt = 0;
+let lastSignalAt = 0;
+let emitGuardUntil = 0;
 
 const latestPrice = new Map();
 const priceBuffers = new Map();
 
 const sseClients = new Set();
-const SSE_PING_MS = 15000;
+const SSE_PING_MS = 10000;
 function sseSend(res, payload, eventName='message'){ res.write(`event: ${eventName}\n`); res.write(`data: ${JSON.stringify(payload)}\n\n`); }
-function sseHello(res){ res.write('retry: 4000\n\n'); }
+function sseHello(res){
+  res.write('retry: 4000\n');
+  res.write(': keepalive\n\n');
+}
 function broadcast(type, payload){ for (const r of sseClients){ try{ sseSend(r, payload, type); }catch{} } }
 function broadcastSignal(sig){ broadcast('signal', sig); }
 function broadcastResult(resu){ broadcast('result', resu); }
-setInterval(()=>{ for (const r of sseClients){ try{ sseSend(r, { t: Date.now(), nextAllowedAt: globalNextAllowedAt }, 'ping'); }catch{} } }, SSE_PING_MS);
+setInterval(()=>{
+  for (const r of sseClients){
+    try{ sseSend(r, { t: Date.now(), nextAllowedAt: globalNextAllowedAt }, 'ping'); }catch{}
+  }
+}, SSE_PING_MS);
 
 const log=(...a)=>console.log('[IaLife]',...a);
 const errlog=(...a)=>console.error('[IaLife][ERR]',...a);
 
-function envView(){ return { DISPLAY_TZ, WS_URL:process.env.WS_URL, HTTP_HOST:process.env.HTTP_HOST, PLATFORM_ID:process.env.PLATFORM_ID, DEMO_MODE: demoMode?'1':'0' }; }
+function envView(){ return { DISPLAY_TZ, WS_URL:process.env.WS_URL, HTTP_HOST:process.env.HTTP_HOST, PLATFORM_ID:process.env.PLATFORM_ID, DEMO_MODE: demoMode?'1':'0', ALLOW:'*' if allowAll else allowedRaw }; }
 
 function fmtHHMM(dateOrTs){
   const d = dateOrTs instanceof Date ? dateOrTs : new Date(dateOrTs);
@@ -156,7 +172,7 @@ function scheduleResult(activeId, name, ordem, entryAtMs, validUntilMs, extra={}
       broadcastResult({
         ativo: name, timeframe: 'M1', ordem,
         entryAt: entryAtMs, validUntil: validUntilMs,
-        entryPrice, closePrice: cp, win, ...extra
+        entryPrice, closePrice: cp, win, prob: extra?.prob
       });
       applyCooldownFrom(validUntilMs);
     }, t2 - t1);
@@ -166,7 +182,7 @@ function scheduleResult(activeId, name, ordem, entryAtMs, validUntilMs, extra={}
 async function loadSdkIfPossible(){
   if (SDKModule || demoMode) return !!SDKModule;
   try { SDKModule = await import('@quadcode-tech/client-sdk-js'); log('Quadcode SDK importado.'); return true; }
-  catch(e){ demoMode=true; lastError='sdk_import_failed'; errlog('Falha import SDK → DEMO', e?.message || e); return false; }
+  catch(e){ demoMode=true; lastError='sdk_import_failed'; console.error('Falha import SDK → DEMO', e?.message || e); return false; }
 }
 
 async function loadBinaryDigitalTickers(currentSdk){
@@ -184,7 +200,7 @@ async function loadBinaryDigitalTickers(currentSdk){
         for (const a of actives) all.add(a.ticker || (`ACTIVE_${a.id}`));
         log(`Ativos ${src.name}:`, actives.length);
       }
-    }catch(e){ errlog(`Erro lendo ${src.name}:`, e?.message || e); }
+    }catch(e){ console.error(`Erro lendo ${src.name}:`, e?.message || e); }
   }
   return all;
 }
@@ -209,8 +225,11 @@ async function wireQuoteSignals(currentSdk){
       if (typeof price !== 'number') return;
       latestPrice.set(activeId, price);
 
+      const nowMs = Date.now();
+      if (nowMs < emitGuardUntil) return;
       if (tradeLock.locked) return;
-      if (Date.now() < globalNextAllowedAt) return;
+      if (nowMs < globalNextAllowedAt) return;
+      if (nowMs - lastSignalAt < MIN_GAP_MS) return;
 
       const buf = pushPrice(activeId, price);
       const avg = sma(buf, 20);
@@ -223,6 +242,8 @@ async function wireQuoteSignals(currentSdk){
       const crossedDown = prev > avg && price < avg;
       if (!crossedUp && !crossedDown) return;
 
+      emitGuardUntil = nowMs + 1500;
+
       const ordemRaw = crossedUp ? 'COMPRA' : 'VENDA';
       const ordem = (ordemRaw === 'COMPRA') ? 'VENDA' : 'COMPRA';
 
@@ -233,6 +254,7 @@ async function wireQuoteSignals(currentSdk){
       const horario = fmtHHMM(entryAt);
 
       const nextAllowed = applyCooldownFrom(validUntil.getTime());
+      lastSignalAt = nowMs;
 
       const payload = {
         ativo:name, timeframe:'M1', ordem, horario, prob,
@@ -278,17 +300,19 @@ async function connectReal(){
     await wireQuoteSignals(sdk);
     return { ok:true };
   }catch(e){
-    connected=false; lastError='connect_failed:'+(e?.message || String(e)); errlog('Erro conectar (real):', e); return { ok:false, error:lastError };
+    connected=false; lastError='connect_failed:'+(e?.message || String(e)); console.error('Erro conectar (real):', e); return { ok:false, error:lastError };
   }
 }
 
-// Demo
+// ===== Demo =====
 let demoInterval = null;
 function startDemoTicker(){
   stopDemoTicker();
   demoInterval = setInterval(()=>{
     if (!connected) return;
-    if (Date.now() < globalNextAllowedAt) return;
+    const nowMs = Date.now();
+    if (nowMs < globalNextAllowedAt) return;
+    if (nowMs - lastSignalAt < MIN_GAP_MS) return;
 
     const base = pairsCache.length ? pairsCache : ['EUR/USD','GBP/USD','USD/JPY'];
     const ativo = base[Math.floor(Math.random()*base.length)];
@@ -304,6 +328,7 @@ function startDemoTicker(){
     const horario = fmtHHMM(entryAt);
 
     const nextAllowed = applyCooldownFrom(validUntil.getTime());
+    lastSignalAt = nowMs;
 
     const payload = {
       ativo, timeframe:'M1', ordem, horario, prob,
@@ -332,13 +357,18 @@ async function connectDemo(){
   return { ok:true, demo:true };
 }
 
-app.get('/status', (req,res)=>{ res.json({ ok:true, connected, lastError, lock: tradeLock, pairs: pairsCache, env: envView(), nextAllowedAt: globalNextAllowedAt }); });
+// ===== Rotas =====
+app.get('/status', (req,res)=>{
+  res.json({ ok:true, connected, lastError, lock: tradeLock, pairs: pairsCache, env: envView(), nextAllowedAt: globalNextAllowedAt });
+});
+
 app.post('/connect', async (req,res)=>{
   if (connected) return res.json({ ok:true, already:true, demo: demoMode, lock: tradeLock, nextAllowedAt: globalNextAllowedAt });
   const result = demoMode ? await connectDemo() : await connectReal();
   if (!result.ok) { const fb = await connectDemo(); return res.json({ ...fb, fallbackFrom: result.error || 'unknown', nextAllowedAt: globalNextAllowedAt }); }
   return res.json({ ...result, lock: tradeLock, nextAllowedAt: globalNextAllowedAt });
 });
+
 app.post('/disconnect', (req,res)=>{
   connected=false; lastError=null;
   if (sdk?.disconnect) try{ sdk.disconnect(); }catch{}
@@ -346,20 +376,29 @@ app.post('/disconnect', (req,res)=>{
   tradeLock = { locked:false, active:null, activeId:null, openedAt:0, expiresAt:0, entryAt:0, validUntil:0, preOpenAt:0 };
   res.json({ ok:true });
 });
+
 app.get('/open-pairs', async (req,res)=>{
   if (!connected) return res.status(400).json({ ok:false, error:'not_connected' });
   return res.json({ ok:true, pairs: pairsCache });
 });
+
 app.get('/events', (req,res)=>{
+  // Garante CORS também aqui (alguns proxies ignoram middleware em streams)
+  if (allowAll){ res.setHeader('Access-Control-Allow-Origin','*'); }
+  else if (req.headers.origin && allowedRaw.includes(req.headers.origin)) res.setHeader('Access-Control-Allow-Origin', req.headers.origin);
+
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.flushHeaders?.();
   sseHello(res);
   sseClients.add(res);
   log('SSE client +1 total:', sseClients.size);
   sseSend(res, { t: Date.now(), connected, nextAllowedAt: globalNextAllowedAt }, 'ping');
   req.on('close', ()=>{ sseClients.delete(res); log('SSE client -1 total:', sseClients.size); try{ res.end(); }catch{} });
 });
+
 app.get('/', (req,res)=> res.json({ ok:true, service:'IaLife Backend', connected, lastError, nextAllowedAt: globalNextAllowedAt }) );
 
-app.listen(PORT, ()=>{ log(`Servidor ouvindo :${PORT}`, envView()); });
+app.listen(PORT, ()=>{ log(`Servidor ouvindo :${PORT}`, {ALLOW_ORIGIN: allowAll?'*':allowedRaw}); });
