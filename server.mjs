@@ -1,4 +1,4 @@
-// server.mjs — IaLife Backend (janela: -30s/+60s da vela alvo, resultado na mesma vela)
+// server.mjs — IaLife Backend (janela: -30s/+60s; inverte ordem; resultado na mesma vela)
 import express from 'express';
 import cors from 'cors';
 
@@ -196,7 +196,11 @@ async function wireQuoteSignals(currentSdk){
 
       acquireTradeLock(name, activeId, preOpenAt, entryAt, validUntil);
 
-      const ordem = crossedUp ? 'COMPRA' : 'VENDA';
+      // Ordem "bruta" pela direção do cruzamento
+      const ordemRaw = crossedUp ? 'COMPRA' : 'VENDA';
+      // Inverte para alinhar com comportamento observado (VENDA -> COMPRA; COMPRA -> VENDA)
+      const ordem = (ordemRaw === 'COMPRA') ? 'VENDA' : 'COMPRA';
+
       const prob  = probFromDistance(price, avg);
       const horario = fmtHHMM(entryAt);
 
@@ -260,7 +264,10 @@ function startDemoTicker(){
     const { preOpenAt, entryAt, validUntil } = computeOpWindow(now);
     acquireTradeLock(ativo, null, preOpenAt, entryAt, validUntil);
 
-    const ordem = Math.random()>0.5?'COMPRA':'VENDA';
+    // Inverte a ordem também no modo demo
+    const ordemRaw = Math.random()>0.5?'COMPRA':'VENDA';
+    const ordem = (ordemRaw === 'COMPRA') ? 'VENDA' : 'COMPRA';
+
     const prob = Math.max(MIN_PROB, 58 + Math.floor(Math.random()*29));
     const horario = fmtHHMM(entryAt);
     const payload = {
@@ -271,6 +278,7 @@ function startDemoTicker(){
     broadcastSignal(payload);
 
     setTimeout(()=>{
+      // Chance baseada na probabilidade
       const winChance = Math.min(0.9, Math.max(MIN_PROB/100, prob/100));
       const win = Math.random() < winChance;
       broadcastResult({ ativo, timeframe:'M1', ordem, entryAt: payload.entryAt, validUntil: payload.validUntil, entryPrice: 1, closePrice: win?1.001:0.999, win, prob });
